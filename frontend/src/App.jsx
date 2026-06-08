@@ -25,6 +25,7 @@ import FeedbackModal from './components/FeedbackModal'
 import FeedbackPanel from './components/FeedbackPanel'
 import AddClientModal from './components/AddClientModal'
 import AgentPanel from './components/AgentPanel'
+import AskSelection from './components/AskSelection'
 
 const POLL_MS = 5000
 const NET_POLL_MS = 3000
@@ -72,6 +73,7 @@ export default function App() {
   const [rebooting, setRebooting] = useState(false)
   const [loginOpen, setLoginOpen] = useState(false)
   const [agentOpen, setAgentOpen] = useState(false)
+  const [askContext, setAskContext] = useState(null)
   const [authUser, setAuthUser] = useState(currentUser())
   const pendingAction = useRef(null)
 
@@ -321,7 +323,15 @@ export default function App() {
         </div>
       </main>
 
-      <AgentPanel open={agentOpen} setOpen={setAgentOpen} runProtected={runProtected} />
+      <AgentPanel
+        open={agentOpen}
+        setOpen={setAgentOpen}
+        runProtected={runProtected}
+        pendingContext={askContext}
+        clearPendingContext={() => setAskContext(null)}
+      />
+
+      <AskSelection onAsk={(text) => { setAskContext(text); setAgentOpen(true) }} />
 
       <DirectoryMenu data={directory} open={directoryOpen} onClose={() => setDirectoryOpen(false)} />
 

@@ -23,11 +23,14 @@ const MD_COMPONENTS = {
 // dashboard left (via padding on .app). The top row lists past conversations
 // (persisted in Postgres); each is a standard chat. Chats survive reloads and
 // restarts — they're removed only by the explicit delete (×) button.
-export default function AgentPanel({ open, setOpen, runProtected }) {
+export default function AgentPanel({ open, setOpen, runProtected, pendingContext, clearPendingContext }) {
   const [conversations, setConversations] = useState([])
   const [activeId, setActiveId] = useState(null)
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
+  // Text the user highlighted on the dashboard and chose to "ask about"; shown as
+  // a chip above the input and folded into the next send (see send()).
+  const [context, setContext] = useState(null)
   const [sending, setSending] = useState(false)
   const [width, setWidth] = useState(() => {
     const saved = parseInt(localStorage.getItem(WIDTH_KEY), 10)
@@ -109,6 +112,16 @@ export default function AgentPanel({ open, setOpen, runProtected }) {
     return () => { cancelled = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open])
+
+  // Adopt a snippet handed in from the dashboard's "Ask about this". Attach it as
+  // the pending context chip (the panel's open-effect already ensures a
+  // conversation exists), then clear it upstream so reopening later doesn't
+  // re-attach a stale selection.
+  useEffect(() => {
+    if (pendingContext == null) return
+    setContext(pendingContext)
+    clearPendingContext()
+  }, [pendingContext, clearPendingContext])
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight
@@ -293,19 +306,26 @@ export default function AgentPanel({ open, setOpen, runProtected }) {
 
   const send = useCallback(async () => {
     const text = input.trim()
-    if (!text || !activeId || sending) return
+    if ((!text && !context) || !activeId || sending) return
+    // Fold a highlighted snippet into the message: the model gets the preamble +
+    // quote, but since we send (and optimistically render) the composed text
+    // verbatim, the live bubble and the reloaded/persisted bubble stay identical.
+    const composed = context
+      ? `Context highlighted from the dashboard (a static snapshot — use your tools for live values if needed):\n\n> ${context.replace(/\n/g, '\n> ')}\n\n${text || 'What does this mean?'}`
+      : text
     setInput('')
-    setMessages(m => [...m, { role: 'user', content: text }])
+    setContext(null)
+    setMessages(m => [...m, { role: 'user', content: composed }])
     setSending(true)
     pendingConvRef.current = activeId
     const ws = wsRef.current
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ conv_id: activeId, message: text }))
+      ws.send(JSON.stringify({ conv_id: activeId, message: composed }))
       // setSending(false) + refresh happen on the 'done' event.
     } else {
-      sendViaPost(activeId, text)
+      sendViaPost(activeId, composed)
     }
-  }, [input, activeId, sending, sendViaPost])
+  }, [input, context, activeId, sending, sendViaPost])
 
   // Answer a root_bash approval prompt over the WS and mark the bubble resolved.
   // Approving runs arbitrary root, so it's gated behind admin login (runProtected
@@ -403,15 +423,29 @@ export default function AgentPanel({ open, setOpen, runProtected }) {
         {sending && <div className="agent-msg agent-msg-assistant agent-typing">…</div>}
       </div>
 
+      {context && (
+        <div className="agent-context">
+          <span className="agent-context-quote">“{context}”</span>
+          <button
+            className="agent-context-clear"
+            onClick={() => setContext(null)}
+            title="Remove highlighted context"
+            aria-label="Remove highlighted context"
+          >
+            ×
+          </button>
+        </div>
+      )}
+
       <form className="agent-input" onSubmit={e => { e.preventDefault(); send() }}>
         <textarea
           value={input}
           onChange={e => setInput(e.target.value)}
           onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } }}
-          placeholder="Ask the assistant…"
+          placeholder={context ? 'Ask about the highlighted text…' : 'Ask the assistant…'}
           rows={2}
         />
-        <button type="submit" disabled={sending || !input.trim()}>Send</button>
+        <button type="submit" disabled={sending || (!input.trim() && !context)}>Send</button>
       </form>
     </aside>
   )

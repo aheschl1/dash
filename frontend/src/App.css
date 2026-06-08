@@ -1072,6 +1072,40 @@ body.agent-resizing .agent-resize::after { background: var(--accent); }
 .agent-deny { background: var(--surface2); color: var(--text); }
 .agent-approval-status { font-size: 12px; color: var(--text-muted); }
 
+/* Highlighted-from-dashboard snippet awaiting a question (see AskSelection). */
+.agent-context {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0 10px;
+  padding: 8px 10px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  font-size: 12px;
+}
+.agent-context-quote {
+  flex: 1;
+  color: var(--text-muted);
+  font-style: italic;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 5.5em;
+  overflow-y: auto;
+}
+.agent-context-clear {
+  flex: 0 0 auto;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.agent-context-clear:hover { color: var(--text); }
+
 .agent-input {
   display: flex;
   gap: 8px;
@@ -1103,6 +1137,24 @@ body.agent-resizing .agent-resize::after { background: var(--accent); }
   cursor: pointer;
 }
 .agent-input button:disabled { opacity: 0.5; cursor: default; }
+
+/* Floating prompt anchored to a text selection anywhere on the dashboard. */
+.ask-selection-btn {
+  position: fixed;
+  transform: translate(-50%, -100%);
+  z-index: 1200;
+  background: var(--accent);
+  color: #0d1117;
+  border: none;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 6px 12px;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+  white-space: nowrap;
+}
+.ask-selection-btn:hover { filter: brightness(1.1); }
 
 /* On phones the rail/push model is too cramped: the dashboard is already a
    single column. Reclaim the full width — collapsed shows a floating button,
