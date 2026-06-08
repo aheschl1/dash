@@ -1,4 +1,4 @@
-# admindash
+### my servers dashboard
 
 Personal server management/insights dashboard. FastAPI backend + React frontend, deployed as a single Docker container behind WireGuard.
 
