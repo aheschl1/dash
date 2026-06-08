@@ -1,0 +1,324 @@
+import subprocess
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Query, Body, Header, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from apscheduler.schedulers.background import BackgroundScheduler
+import docker as docker_sdk
+
+import auth
+from db import (init_db, insert_snapshot, query_history, insert_event, query_events,
+               insert_feedback, list_feedback, update_feedback_status,
+               get_auth_secret, get_user, set_password)
+from collectors import system, gpu, temps, containers, ports, wireguard, disk, processes, network, connections
+from collectors import events as events_collector, smart, alerts, sessions, hardware, vms, cron, directory, vpn
+from agent import router as agent_router
+
+
+def _collect_and_store() -> None:
+    sys_data = system.collect()
+    gpu_data = gpu.collect()
+    temp_data = temps.collect()
+
+    cpu_temp = temp_data.get("cpu_Tctl")
+    gpu_util = gpu_data["util_pct"] if gpu_data else None
+    gpu_temp_val = gpu_data["temp_c"] if gpu_data else None
+
+    insert_snapshot(
+        cpu_pct=sys_data["cpu_pct"],
+        ram_pct=sys_data["ram_pct"],
+        gpu_util=gpu_util,
+        gpu_temp=gpu_temp_val,
+        cpu_temp=cpu_temp,
+    )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(_collect_and_store, "interval", seconds=60, id="collect")
+    scheduler.add_job(
+        lambda: events_collector.poll_and_store(insert_event),
+        "interval", seconds=15, id="events"
+    )
+    scheduler.start()
+    _collect_and_store()
+    events_collector.poll_and_store(insert_event)
+    yield
+    scheduler.shutdown()
+
+
+app = FastAPI(
+    lifespan=lifespan,
+    title="admindash API",
+    version="1.0.0",
+    description=(
+        "Backend API for admindash, a personal server management dashboard. "
+        "Exposes host system metrics (CPU/RAM/GPU/temps/disk/SMART), Docker "
+        "container inspection and control, network surface (open ports, "
+        "conntrack flows, WireGuard peers, SSH sessions), threshold alerts, "
+        "metric history, and a feedback queue."
+    ),
+    contact={"name": "admindash", "email": "ajheschl@gmail.com"},
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["*"],
+)
+
+app.include_router(agent_router)
+
+
+# ── Auth ────────────────────────────────────────────────────────────────────
+
+def require_admin(authorization: str | None = Header(default=None)) -> dict:
+    """Gate for mutating endpoints. Reads `Authorization: Bearer <token>`."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    payload = auth.verify_token(authorization.split(" ", 1)[1], get_auth_secret())
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return payload
+
+
+@app.post("/api/auth/login")
+def login(username: str = Body(...), password: str = Body(...)):
+    user = get_user(username)
+    if not user or not auth.verify_password(password, user["salt"], user["password_hash"]):
+        return JSONResponse(status_code=401, content={"error": "Invalid credentials"})
+    token, expires_at = auth.create_token(user["username"], user["role"], get_auth_secret())
+    return {"token": token, "expires_at": expires_at, "username": user["username"], "role": user["role"]}
+
+
+@app.get("/api/auth/me")
+def auth_me(user: dict = Depends(require_admin)):
+    return {"username": user["sub"], "role": user.get("role")}
+
+
+@app.post("/api/auth/change-password")
+def change_password(
+    old_password: str = Body(...),
+    new_password: str = Body(...),
+    user: dict = Depends(require_admin),
+):
+    if len(new_password) < 8:
+        return JSONResponse(status_code=400, content={"error": "new password must be at least 8 characters"})
+    current = get_user(user["sub"])
+    if not current or not auth.verify_password(old_password, current["salt"], current["password_hash"]):
+        return JSONResponse(status_code=401, content={"error": "current password incorrect"})
+    set_password(user["sub"], new_password)
+    return {"status": "ok"}
+
+
+@app.get("/api/stats")
+def get_stats():
+    return system.collect()
+
+
+@app.get("/api/hardware")
+def get_hardware():
+    return hardware.collect()
+
+
+@app.get("/api/vms")
+def get_vms():
+    return vms.collect()
+
+
+@app.get("/api/vms/{name}/logs")
+def get_vm_logs(name: str, lines: int = Query(default=100, ge=10, le=1000)):
+    result = vms.logs(name, lines)
+    if "error" in result and "not found" in result["error"]:
+        return JSONResponse(status_code=404, content=result)
+    return result
+
+
+@app.get("/api/vms/{name}/network")
+def get_vm_network(name: str):
+    result = vms.net_info(name)
+    if "error" in result and "not found" in result["error"]:
+        return JSONResponse(status_code=404, content=result)
+    return result
+
+
+@app.get("/api/gpu")
+def get_gpu():
+    return gpu.collect()
+
+
+@app.get("/api/gpu/processes")
+def get_gpu_processes():
+    return gpu.collect_processes()
+
+
+@app.get("/api/temps")
+def get_temps():
+    return temps.collect()
+
+
+@app.get("/api/containers")
+def get_containers():
+    return containers.collect()
+
+
+@app.post("/api/containers/{name}/action")
+def container_action(name: str, action: str = Body(..., embed=True), user: dict = Depends(require_admin)):
+    if action not in ("start", "stop", "restart"):
+        return JSONResponse(status_code=400, content={"error": "Invalid action"})
+    try:
+        client = docker_sdk.from_env()
+        c = client.containers.get(name)
+        getattr(c, action)()
+        c.reload()
+        return {"name": name, "action": action, "status": c.status}
+    except docker_sdk.errors.NotFound:
+        return JSONResponse(status_code=404, content={"error": "Not found"})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/api/ports")
+def get_ports():
+    return ports.collect()
+
+
+@app.get("/api/connections")
+def get_connections():
+    return connections.collect()
+
+
+@app.get("/api/wireguard")
+def get_wireguard():
+    return wireguard.collect()
+
+
+@app.post("/api/vpn/clients")
+def add_vpn_client(
+    name: str = Body(...),
+    address: str = Body(...),
+    user: dict = Depends(require_admin),
+):
+    try:
+        return vpn.add_client(name, address)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/api/history")
+def get_history(minutes: int = Query(default=1440, ge=1, le=1440)):
+    return query_history(minutes)
+
+
+@app.get("/api/disk")
+def get_disk():
+    return disk.collect()
+
+
+@app.get("/api/processes")
+def get_processes():
+    return processes.collect()
+
+
+@app.get("/api/network")
+def get_network():
+    return network.collect()
+
+
+@app.get("/api/logs/{name}")
+def get_logs(name: str, lines: int = Query(default=100, ge=10, le=1000)):
+    try:
+        client = docker_sdk.from_env()
+        c = client.containers.get(name)
+        raw = c.logs(tail=lines, timestamps=True)
+        text = raw.decode("utf-8", errors="replace")
+        log_lines = [l for l in text.splitlines() if l]
+        return {"name": name, "lines": log_lines}
+    except docker_sdk.errors.NotFound:
+        return JSONResponse(status_code=404, content={"error": f"Container '{name}' not found"})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/api/events")
+def get_events(limit: int = Query(default=30, ge=1, le=100)):
+    return query_events(limit)
+
+
+@app.get("/api/smart")
+def get_smart():
+    return smart.collect()
+
+
+@app.get("/api/alerts")
+def get_alerts():
+    return alerts.collect()
+
+
+@app.get("/api/sessions")
+def get_sessions():
+    return sessions.collect()
+
+
+@app.get("/api/cron")
+def get_cron():
+    return cron.collect()
+
+
+@app.get("/api/directory")
+def get_directory():
+    return directory.collect()
+
+
+# ── Host control ──────────────────────────────────────────────────────────────
+
+@app.post("/api/host/reboot")
+def host_reboot(user: dict = Depends(require_admin)):
+    try:
+        subprocess.Popen(
+            ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
+             "systemctl", "reboot"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return {"status": "rebooting"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+# ── Feedback ──────────────────────────────────────────────────────────────────
+
+@app.get("/api/feedback")
+def get_feedback(status: str = Query(default=None)):
+    return list_feedback(status=status)
+
+
+@app.post("/api/feedback")
+def submit_feedback(
+    title: str = Body(...),
+    description: str = Body(default=""),
+):
+    if not title.strip():
+        return JSONResponse(status_code=400, content={"error": "title required"})
+    id = insert_feedback("feedback", title.strip()[:200], description.strip()[:2000])
+    return {"id": id}
+
+
+@app.post("/api/feedback/{id}/status")
+def set_feedback_status(
+    id: int,
+    status: str = Body(...),
+    note: str = Body(default=None),
+    user: dict = Depends(require_admin),
+):
+    valid = {"pending", "in-progress", "done", "needs-review", "failed"}
+    if status not in valid:
+        return JSONResponse(status_code=400, content={"error": f"status must be one of {valid}"})
+    update_feedback_status(id, status, note)
+    return {"id": id, "status": status}
+
+

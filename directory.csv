@@ -1,0 +1,11 @@
+Name,Domain,Ip
+Jellyfin,jellyfin.andrewheschl.ca,10.8.0.1:8096
+Llama,llama.andrewheschl.ca,10.8.0.1:8080
+Immich,immich.andrewheschl.ca,10.8.0.1:2283
+Vaultwarden,vault.andrewheschl.ca,10.8.0.1:8222
+admindash,dash.andrewheschl.ca,10.8.0.1:8090
+admindash (LAN HTTPS),dash.andrewheschl.ca,10.0.0.18:443
+JupyterLab,jupyter.andrewheschl.ca,10.8.0.1:8888
+Ollama,ollama.andrewheschl.ca,10.8.0.1:11434
+qBittorrent WebUI,,10.8.0.1:5467
+Postgres,,127.0.0.1:5432
