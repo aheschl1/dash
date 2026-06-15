@@ -6,4 +6,4 @@ Has a small agent harness for interpreting the data and performing small tasks, 
 
 I wrote like none of this, thanks claude
 
-<img width="1906" height="933" alt="image" src="https://github.com/user-attachments/assets/4b4a62d0-23c9-4a06-8b9c-230298e1ebcc" />
+<img width="1919" height="932" alt="image" src="https://github.com/user-attachments/assets/54781e5b-0156-4233-a1de-fc143bad3e58" />
