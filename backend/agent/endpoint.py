@@ -16,8 +16,6 @@ reloads, and are removed only by an explicit end or the DB's most-recent-N cap.
 import asyncio
 import json
 import os
-import threading
-import uuid
 
 from fastapi import APIRouter, Body, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -26,13 +24,14 @@ import auth
 import db
 
 from . import store
+from .approval import ApprovalGate
 from .main import continue_conversation
 
 router = APIRouter()
 
-# How long the agent loop blocks waiting for the user to approve/deny a root_bash
-# command before giving up and treating it as denied (so a never-answered prompt
-# can't pin a worker thread or a busy claim forever).
+# How long the agent loop blocks waiting for the user to approve/deny a gated tool
+# call (root_bash / post) before giving up and treating it as denied (so a
+# never-answered prompt can't pin a worker thread or a busy claim forever).
 APPROVAL_TIMEOUT = int(os.environ.get("AGENT_APPROVAL_TIMEOUT", "180"))
 
 
@@ -90,7 +89,7 @@ def send(conv_id: str, message: str = Body(..., embed=True)):
     if not store.try_begin(conv_id):
         return JSONResponse(status_code=409, content={"error": "conversation is busy"})
     try:
-        answer = continue_conversation(messages, message.strip())
+        answer = continue_conversation(messages, message.strip(), conv_id=conv_id)
         store.save(conv_id, messages)
         return {"answer": answer}
     except Exception as e:
@@ -124,30 +123,25 @@ def end(conv_id: str):
 _running: "dict[str, _Turn]" = {}
 
 
-class _Approval:
-    """A pending root_bash approval. The agent's executor thread blocks on
-    `event` until the WS handler (on the loop thread) resolves it; both touch
-    only `approved`/`event`, which are thread-safe to hand across like this."""
-
-    def __init__(self, command: str):
-        self.command = command
-        self.approved = False
-        self.event = threading.Event()
-
-
 class _Turn:
     """A running agent turn other sockets can subscribe to, even after the
     originating socket is gone. Lives on the event loop thread; `dispatch` is
     fed from the agent's executor thread via call_soon_threadsafe, so all access
-    to `events`/`subscribers`/`approvals` happens single-threaded on the loop."""
+    to `events`/`subscribers` happens single-threaded on the loop.
+
+    Owns one `ApprovalGate` (built here because the WS handler that constructs the
+    turn runs on the loop) through which every gated tool — root_bash, post —
+    requests human approval."""
 
     def __init__(self, conv_id: str, user_message: str):
         self.conv_id = conv_id
         self.user_message = user_message
         self.events: list[dict] = []           # buffered tool_call events for replay
         self.subscribers: "set[asyncio.Queue]" = set()
-        self.approvals: "dict[str, _Approval]" = {}
         self.task: "asyncio.Task | None" = None
+        self.gate = ApprovalGate(
+            asyncio.get_running_loop(), self.dispatch, conv_id, APPROVAL_TIMEOUT
+        )
 
     def attach(self, q: "asyncio.Queue") -> list[dict]:
         """Subscribe a queue and atomically snapshot what already happened.
@@ -167,21 +161,6 @@ class _Turn:
         for q in self.subscribers:
             q.put_nowait(ev)
 
-    def add_approval(self, approval_id: str, approval: "_Approval") -> None:
-        self.approvals[approval_id] = approval
-
-    def pop_approval(self, approval_id: str) -> None:
-        self.approvals.pop(approval_id, None)
-
-    def resolve_approval(self, approval_id: str, approved: bool) -> None:
-        approval = self.approvals.get(approval_id)
-        if approval is not None:
-            approval.approved = approved
-            approval.event.set()
-
-    def pending_approvals(self) -> list[dict]:
-        return [{"approval_id": k, "command": a.command} for k, a in self.approvals.items()]
-
 
 async def _run_turn(turn: "_Turn", messages: list[dict]) -> None:
     """Drive one turn to completion and persist it, regardless of who's listening.
@@ -196,27 +175,9 @@ async def _run_turn(turn: "_Turn", messages: list[dict]) -> None:
     def on_event(ev):
         loop.call_soon_threadsafe(turn.dispatch, {**ev, "conv_id": conv_id})
 
-    # Blocking approval gate for root_bash. Runs on the executor thread: register
-    # the pending approval and emit an approval_request, then block on the Event
-    # until the WS handler resolves it (or we time out and deny). All loop-thread
-    # state (approvals/subscribers) is touched only via call_soon_threadsafe.
-    def request_approval(command: str) -> bool:
-        approval = _Approval(command)
-        approval_id = uuid.uuid4().hex
-        loop.call_soon_threadsafe(turn.add_approval, approval_id, approval)
-        loop.call_soon_threadsafe(turn.dispatch, {
-            "type": "approval_request",
-            "conv_id": conv_id,
-            "approval_id": approval_id,
-            "command": command,
-        })
-        got = approval.event.wait(timeout=APPROVAL_TIMEOUT)
-        loop.call_soon_threadsafe(turn.pop_approval, approval_id)
-        return bool(got and approval.approved)
-
     try:
         answer = await loop.run_in_executor(
-            None, continue_conversation, messages, turn.user_message, on_event, request_approval
+            None, continue_conversation, messages, turn.user_message, on_event, turn.gate.request, conv_id
         )
         await loop.run_in_executor(None, store.save, conv_id, messages)
         turn.dispatch({"type": "answer", "conv_id": conv_id, "content": answer})
@@ -289,7 +250,7 @@ async def ws_agent(ws: WebSocket):
                 "conv_id": turn.conv_id,
                 "user_message": turn.user_message,
                 "events": buffered,
-                "approvals": turn.pending_approvals(),
+                "approvals": turn.gate.pending(),
             })
 
     writer_task = asyncio.create_task(writer())
@@ -312,10 +273,13 @@ async def ws_agent(ws: WebSocket):
                 if turn is None:
                     continue
                 approved = bool((data or {}).get("approved"))
-                if approved and not auth.verify_token((data or {}).get("token") or "", db.get_auth_secret()):
+                token = (data or {}).get("token") or ""
+                if approved and not auth.verify_token(token, db.get_auth_secret()):
                     out.put_nowait({"type": "approval_unauthorized", "conv_id": conv_id, "approval_id": approval_id})
                     continue
-                turn.resolve_approval(approval_id, approved)
+                # Pass the verified token through: the `post` tool reuses it to
+                # authenticate its loopback call; root_bash ignores it.
+                turn.gate.resolve(approval_id, approved, token if approved else None)
                 continue
 
             if subscribe_req:

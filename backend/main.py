@@ -9,7 +9,8 @@ import docker as docker_sdk
 import auth
 from db import (init_db, insert_snapshot, query_history, insert_event, query_events,
                insert_feedback, list_feedback, update_feedback_status,
-               get_auth_secret, get_user, set_password)
+               get_auth_secret, get_user, set_password,
+               memory_list, memory_save, memory_update, memory_delete)
 from collectors import system, gpu, temps, containers, ports, wireguard, disk, processes, network, connections
 from collectors import events as events_collector, smart, alerts, sessions, hardware, vms, cron, directory, vpn
 from agent import router as agent_router
@@ -320,5 +321,51 @@ def set_feedback_status(
         return JSONResponse(status_code=400, content={"error": f"status must be one of {valid}"})
     update_feedback_status(id, status, note)
     return {"id": id, "status": status}
+
+
+# ── Agent memories ────────────────────────────────────────────────────────────
+# Browse/curate the durable facts the agent injects into every conversation's
+# system prompt. Reading is public (read-only, like every other GET); creating,
+# editing, and deleting are admin-gated — they change what the agent "knows".
+
+MEMORY_MAX_LEN = 2000
+
+
+@app.get("/api/memories")
+def get_memories():
+    return {"memories": memory_list()}
+
+
+@app.post("/api/memories")
+def add_memory(
+    content: str = Body(..., embed=True),
+    user: dict = Depends(require_admin),
+):
+    content = content.strip()
+    if not content:
+        return JSONResponse(status_code=400, content={"error": "content required"})
+    id = memory_save(content[:MEMORY_MAX_LEN])
+    return {"id": id}
+
+
+@app.put("/api/memories/{id}")
+def edit_memory(
+    id: int,
+    content: str = Body(..., embed=True),
+    user: dict = Depends(require_admin),
+):
+    content = content.strip()
+    if not content:
+        return JSONResponse(status_code=400, content={"error": "content required"})
+    if not memory_update(id, content[:MEMORY_MAX_LEN]):
+        return JSONResponse(status_code=404, content={"error": "unknown memory"})
+    return {"id": id, "content": content}
+
+
+@app.delete("/api/memories/{id}")
+def remove_memory(id: int, user: dict = Depends(require_admin)):
+    if not memory_delete(id):
+        return JSONResponse(status_code=404, content={"error": "unknown memory"})
+    return {"deleted": id}
 
 

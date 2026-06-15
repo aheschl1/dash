@@ -756,6 +756,31 @@ tr:hover td { background: var(--surface2); }
 .feedback-note { font-size: 11px; color: var(--text-muted); margin-top: 3px; font-style: italic; word-break: break-word; }
 .feedback-count { font-size: 12px; color: var(--text-muted); font-weight: 400; text-transform: none; letter-spacing: 0; }
 
+/* Agent memories */
+.memory-add { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 10px; }
+.memory-input {
+  flex: 1; min-width: 0; resize: vertical; font: inherit; font-size: 13px;
+  color: var(--text); background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 6px; padding: 7px 9px; line-height: 1.4;
+}
+.memory-input:focus { outline: none; border-color: var(--accent); }
+.memory-list { display: flex; flex-direction: column; gap: 6px; }
+.memory-item { display: flex; align-items: flex-start; gap: 8px; padding: 8px; background: var(--surface2); border: 1px solid var(--border); border-radius: 6px; }
+.memory-id { font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; flex-shrink: 0; padding-top: 2px; }
+.memory-content { flex: 1; min-width: 0; font-size: 13px; word-break: break-word; white-space: pre-wrap; }
+.memory-edit { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.memory-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.memory-btn {
+  font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 6px; cursor: pointer;
+  background: var(--accent); border: 1px solid var(--accent); color: #0d1117; white-space: nowrap;
+}
+.memory-btn:hover:not(:disabled) { filter: brightness(1.1); }
+.memory-btn:disabled { opacity: 0.5; cursor: default; }
+.memory-btn-ghost { background: transparent; border-color: var(--border); color: var(--text-muted); }
+.memory-btn-ghost:hover:not(:disabled) { color: var(--text); filter: none; }
+.memory-btn-danger { background: transparent; border-color: var(--border); color: var(--red); }
+.memory-btn-danger:hover:not(:disabled) { border-color: var(--red); filter: none; }
+
 /* Feedback submit form */
 .feedback-form { display: flex; flex-direction: column; gap: 14px; padding: 16px; }
 .form-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-bottom: 5px; }

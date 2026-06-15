@@ -183,7 +183,7 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
     } else if (ev.type === 'error') {
       setMessages(m => [...m, { role: 'assistant', content: `Error: ${ev.error}` }])
     } else if (ev.type === 'approval_request') {
-      setMessages(m => [...m, { role: 'approval', approval_id: ev.approval_id, command: ev.command, status: 'pending' }])
+      setMessages(m => [...m, { role: 'approval', approval_id: ev.approval_id, kind: ev.kind, summary: ev.summary, detail: ev.detail, status: 'pending' }])
     } else if (ev.type === 'approval_unauthorized') {
       // Server rejected the token (missing/expired). Drop it so a retry re-prompts
       // login, and revert the optimistically-approved bubble back to pending.
@@ -204,7 +204,7 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
       if (ev.conv_id !== activeIdRef.current) return
       const base = Array.isArray(prior) ? prior : []
       const chips = (ev.events || []).map(e => ({ role: 'tool', content: toolChipText(e) }))
-      const approvals = (ev.approvals || []).map(a => ({ role: 'approval', approval_id: a.approval_id, command: a.command, status: 'pending' }))
+      const approvals = (ev.approvals || []).map(a => ({ role: 'approval', approval_id: a.approval_id, kind: a.kind, summary: a.summary, detail: a.detail, status: 'pending' }))
       setMessages([...base, { role: 'user', content: ev.user_message }, ...chips, ...approvals])
     } else if (ev.type === 'idle') {
       // Nothing running. If we were awaiting this conv, its turn finished while we
@@ -327,10 +327,10 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
     }
   }, [input, context, activeId, sending, sendViaPost])
 
-  // Answer a root_bash approval prompt over the WS and mark the bubble resolved.
-  // Approving runs arbitrary root, so it's gated behind admin login (runProtected
-  // prompts for it and replays on success) and carries the Bearer token the server
-  // re-verifies; denying needs no auth.
+  // Answer a gated-tool approval prompt (root_bash / post) over the WS and mark the
+  // bubble resolved. Approving runs a privileged action, so it's gated behind admin
+  // login (runProtected prompts for it and replays on success) and carries the Bearer
+  // token the server re-verifies; denying needs no auth.
   const sendApproval = useCallback((approvalId, approved) => {
     const ws = wsRef.current
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -403,8 +403,8 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
           if (m.role === 'tool') return <div key={i} className="agent-tool">→ {m.content}</div>
           if (m.role === 'approval') return (
             <div key={i} className={`agent-approval agent-approval-${m.status}`}>
-              <div className="agent-approval-head">Run this command as root?</div>
-              <pre className="agent-approval-cmd">{m.command}</pre>
+              <div className="agent-approval-head">{m.kind === 'post' ? 'Send this request?' : 'Run this command as root?'}</div>
+              <pre className="agent-approval-cmd">{m.detail ?? m.command}</pre>
               {m.status === 'pending'
                 ? <div className="agent-approval-actions">
                     <button className="agent-approve" onClick={() => respondApproval(m.approval_id, true)}>Approve</button>

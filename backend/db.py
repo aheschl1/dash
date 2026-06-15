@@ -64,6 +64,18 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     updated_at BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_chat_sessions_updated ON chat_sessions(updated_at);
+CREATE TABLE IF NOT EXISTS agent_memories (
+    id         SERIAL PRIMARY KEY,
+    content    TEXT NOT NULL,
+    created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS conversation_notes (
+    id         SERIAL PRIMARY KEY,
+    conv_id    TEXT NOT NULL,
+    content    TEXT NOT NULL,
+    created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_conversation_notes_conv ON conversation_notes(conv_id);
 DROP TABLE IF EXISTS feedback_runs;
 """
 
@@ -245,11 +257,21 @@ def chat_save(id: str, messages: list[dict]) -> None:
             "updated_at=EXCLUDED.updated_at",
             (id, _chat_title(messages), _chat_turns(messages), payload, now, now),
         )
-        con.execute(
+        pruned = con.execute(
             "DELETE FROM chat_sessions WHERE id NOT IN "
-            "(SELECT id FROM chat_sessions ORDER BY updated_at DESC LIMIT %s)",
+            "(SELECT id FROM chat_sessions ORDER BY updated_at DESC LIMIT %s) "
+            "RETURNING id",
             (CHAT_SESSIONS_MAX,),
-        )
+        ).fetchall()
+        if pruned:
+            # Conversation notes are scoped to a chat; drop them with it. Safe to
+            # key off the pruned ids (not "all ids missing from chat_sessions")
+            # because a brand-new conversation may hold notes before its first
+            # chat_save row exists, and we must not delete those.
+            con.execute(
+                "DELETE FROM conversation_notes WHERE conv_id = ANY(%s)",
+                ([r[0] for r in pruned],),
+            )
         con.commit()
 
 
@@ -273,8 +295,77 @@ def chat_list(limit: int = 100) -> list[dict]:
 def chat_delete(id: str) -> bool:
     with psycopg.connect(DSN) as con:
         n = con.execute("DELETE FROM chat_sessions WHERE id=%s", (id,)).rowcount
+        con.execute("DELETE FROM conversation_notes WHERE conv_id=%s", (id,))
         con.commit()
     return n > 0
+
+
+# ── Agent memories ────────────────────────────────────────────────────────────
+
+
+def memory_save(content: str) -> int:
+    """Persist a free-text memory the agent wants to recall in future chats."""
+    now = int(datetime.now(timezone.utc).timestamp())
+    with psycopg.connect(DSN) as con:
+        row = con.execute(
+            "INSERT INTO agent_memories (content, created_at) VALUES (%s,%s) RETURNING id",
+            (content, now),
+        ).fetchone()
+        con.commit()
+    return row[0]
+
+
+def memory_delete(id: int) -> bool:
+    with psycopg.connect(DSN) as con:
+        n = con.execute("DELETE FROM agent_memories WHERE id=%s", (id,)).rowcount
+        con.commit()
+    return n > 0
+
+
+def memory_update(id: int, content: str) -> bool:
+    """Replace a memory's text in place, keeping its id (so the agent's prompt
+    references stay stable). False if no such id."""
+    with psycopg.connect(DSN) as con:
+        n = con.execute(
+            "UPDATE agent_memories SET content=%s WHERE id=%s", (content, id)
+        ).rowcount
+        con.commit()
+    return n > 0
+
+
+def memory_list() -> list[dict]:
+    with psycopg.connect(DSN) as con:
+        rows = con.execute(
+            "SELECT id, content, created_at FROM agent_memories ORDER BY id"
+        ).fetchall()
+    return [{"id": r[0], "content": r[1], "created_at": r[2]} for r in rows]
+
+
+# ── Conversation notes ──────────────────────────────────────────────────────────
+# Like memories, but scoped to a single conversation and injected fresh per run
+# (never baked into the persisted system prompt) so they stay current across turns
+# and reloads. Removed with the conversation (see chat_delete / chat_save prune).
+
+
+def conv_note_save(conv_id: str, content: str) -> int:
+    now = int(datetime.now(timezone.utc).timestamp())
+    with psycopg.connect(DSN) as con:
+        row = con.execute(
+            "INSERT INTO conversation_notes (conv_id, content, created_at) "
+            "VALUES (%s,%s,%s) RETURNING id",
+            (conv_id, content, now),
+        ).fetchone()
+        con.commit()
+    return row[0]
+
+
+def conv_note_list(conv_id: str) -> list[dict]:
+    with psycopg.connect(DSN) as con:
+        rows = con.execute(
+            "SELECT id, content FROM conversation_notes WHERE conv_id=%s ORDER BY id",
+            (conv_id,),
+        ).fetchall()
+    return [{"id": r[0], "content": r[1]} for r in rows]
 
 
 def query_history(minutes: int = 1440) -> list[dict]:

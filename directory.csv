@@ -7,3 +7,4 @@ admindash,dash.andrewheschl.ca,10.8.0.1:8090
 admindash (LAN HTTPS),dash.andrewheschl.ca,10.0.0.18:443
 JupyterLab,jupyter.andrewheschl.ca,10.8.0.1:8888
 Ollama,ollama.andrewheschl.ca,10.8.0.1:11434
+Cansbridge,cansbridge.andrewheschl.ca,10.8.0.1:8095

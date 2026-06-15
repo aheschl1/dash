@@ -14,7 +14,15 @@ import urllib.request
 
 from openai import OpenAI
 
-from .prompt import LOCAL_API, build_system_prompt
+import db
+from .approval import ApprovalRequest
+from .safe_commands import is_safe_command
+from .prompt import (
+    LOCAL_API,
+    build_conversation_notes_block,
+    build_memory_block,
+    build_system_prompt,
+)
 
 # llama-cpp's OpenAI-compatible server, reachable by container name over
 # wg-network. The SDK appends /chat/completions to this base. llama.cpp does
@@ -116,13 +124,14 @@ TOOLS = [
         "function": {
             "name": "root_bash",
             "description": (
-                "Run an arbitrary bash command as ROOT on the host. Powerful and "
-                "potentially destructive, so EVERY invocation must be approved by "
-                "the user in the dashboard before it runs; if they decline it does "
-                "not execute. Prefer the read-only tools (get_stat, cat_file, "
+                "Run an arbitrary bash command as ROOT on the host. Most "
+                "non-mutating (read-only) commands pass automatically and run "
+                "without a prompt; anything that could change state must be "
+                "approved by the user in the dashboard before it runs, and if "
+                "they decline it does not execute. Prefer the read-only tools (get_stat, cat_file, "
                 "ls_folder, web_search) for inspection and answering questions — "
-                "only reach for root_bash when the user explicitly asks you to take "
-                "an action those tools cannot perform. Returns the command's exit "
+                "only reach for root_bash when the other tools are insufficient."
+                "Returns the command's exit "
                 "code and combined stdout/stderr, or a note if it was denied."
             ),
             "parameters": {
@@ -131,6 +140,99 @@ TOOLS = [
                     "command": {"type": "string", "description": "The bash command to run on the host."}
                 },
                 "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "post",
+            "description": (
+                "Take an ACTION by issuing a POST to a mutating admindash API "
+                "endpoint (the locked ones, e.g. '/api/containers/{name}/action', "
+                "'/api/host/reboot', '/api/feedback/{id}/status'). Like root_bash, "
+                "EVERY invocation must be approved by the user in the dashboard "
+                "before it runs; if they decline it does not execute. Prefer this "
+                "over root_bash whenever the API already exposes the action — it is "
+                "structured and safer. Pass the API `path` and an optional JSON "
+                "`body`. Returns the raw JSON response body, or a note if it was "
+                "denied."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "API path starting with '/api/'.",
+                    },
+                    "body": {
+                        "type": "object",
+                        "description": "JSON request body (omit if the endpoint takes none).",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_memory",
+            "description": (
+                "Persist one durable, non-obvious fact about this machine, injected "
+                "into your system prompt in EVERY future conversation — a host quirk, "
+                "a non-obvious config, where something lives, the fix for a recurring "
+                "problem, or a fact Andrew asks you to remember. One self-contained "
+                "fact per call. First scan the memories already in your prompt: do "
+                "NOT save ephemeral state (temperatures, CPU%, uptime), anything "
+                "already in the prompt, or a duplicate/near-duplicate of an existing "
+                "memory. Returns the new memory's integer id."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "The fact to remember."}
+                },
+                "required": ["content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_conversation_note",
+            "description": (
+                "Record a finding scoped to the CURRENT conversation only (it never "
+                "crosses into other chats) — a tool-result finding, a cause you "
+                "pinned down, or an intermediate result worth keeping across turns, "
+                "so you don't re-derive it later in this chat. For durable, "
+                "machine-wide facts future conversations should also know, use "
+                "save_memory instead. Notes appear right after your memories."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note": {"type": "string", "description": "The note to record for this conversation."}
+                },
+                "required": ["note"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_memory",
+            "description": (
+                "Delete a saved memory by its integer id (the id shown next to "
+                "each memory in your system prompt). Use it to prune memories that "
+                "have become wrong or obsolete."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "The id of the memory to delete."}
+                },
+                "required": ["id"],
             },
         },
     },
@@ -234,6 +336,45 @@ def root_bash(command: str) -> str:
     return f"exit {result.returncode}\n{out}"
 
 
+def save_memory(content: str) -> str:
+    """Persist a free-text memory for recall in future conversations."""
+    content = (content or "").strip()
+    if not content:
+        return "(nothing to save: empty memory)"
+    try:
+        mid = db.memory_save(content)
+    except Exception as e:
+        return f"(failed to save memory: {e})"
+    return f"saved memory [{mid}]"
+
+
+def delete_memory(id) -> str:
+    """Delete a saved memory by id."""
+    try:
+        mid = int(id)
+    except (TypeError, ValueError):
+        return f"(invalid memory id: {id!r})"
+    try:
+        deleted = db.memory_delete(mid)
+    except Exception as e:
+        return f"(failed to delete memory: {e})"
+    return f"deleted memory [{mid}]" if deleted else f"(no memory with id {mid})"
+
+
+def add_conversation_note(conv_id: str | None, note: str) -> str:
+    """Persist a note scoped to a single conversation for recall on later turns."""
+    note = (note or "").strip()
+    if not note:
+        return "(nothing to save: empty note)"
+    if not conv_id:
+        return "(conversation notes unavailable on this path; not saved)"
+    try:
+        nid = db.conv_note_save(conv_id, note)
+    except Exception as e:
+        return f"(failed to save note: {e})"
+    return f"saved conversation note [{nid}]"
+
+
 def get_stat(path: str) -> str:
     """Curl a GET endpoint on the local admindash API and return the body."""
     if not path.startswith("/"):
@@ -244,6 +385,28 @@ def get_stat(path: str) -> str:
         capture_output=True,
         text=True,
     )
+    return result.stdout or result.stderr or "(empty response)"
+
+
+def post_stat(path: str, body, token: str | None) -> str:
+    """POST to a mutating endpoint on the local admindash API and return the body.
+
+    Authenticates with the admin token the user supplied when approving (the 🔒
+    endpoints re-verify it server-side). Only loopback `/api/` paths are allowed —
+    a model-supplied path can't be turned into an arbitrary URL. Approval at the
+    call site (see _run_loop) is the real guard; this is defense in depth."""
+    if not path.startswith("/"):
+        path = "/" + path
+    if not path.startswith("/api/"):
+        return "(post refused: path must start with /api/)"
+    url = f"{LOCAL_API}{path}"
+    args = ["curl", "-s", "--max-time", "15", "-X", "POST", url,
+            "-H", "Content-Type: application/json"]
+    if token:
+        args += ["-H", f"Authorization: Bearer {token}"]
+    if body is not None:
+        args += ["-d", json.dumps(body)]
+    result = subprocess.run(args, capture_output=True, text=True)
     return result.stdout or result.stderr or "(empty response)"
 
 
@@ -285,16 +448,37 @@ def web_search(query: str) -> str:
     return "\n".join(parts) or "(no results)"
 
 
-def _run_loop(messages: list[dict], on_event=None, request_approval=None) -> str:
+def _with_memories(messages: list[dict], conv_id: str | None = None) -> list[dict]:
+    """Return a copy of `messages` with current memories — and, when `conv_id` is
+    given, this conversation's notes after them — appended to the system prompt's
+    content. Both are injected per-call and never persisted, so resumed chats and
+    chats created before a save still see the latest memories, and notes added
+    earlier in a conversation stay visible on later turns (the stored system
+    prompt deliberately holds neither — see prompt.build_memory_block /
+    build_conversation_notes_block)."""
+    block = build_memory_block()
+    if conv_id:
+        block += "\n\n" + build_conversation_notes_block(conv_id)
+    out = list(messages)
+    if out and out[0].get("role") == "system":
+        out[0] = {**out[0], "content": out[0]["content"] + "\n\n" + block}
+    else:
+        out = [{"role": "system", "content": block}] + out
+    return out
+
+
+def _run_loop(messages: list[dict], on_event=None, request_approval=None, conv_id=None) -> str:
     """Drive `messages` through tool calls to a final answer.
 
     Appends assistant and tool messages in place so callers that retain the
     list (conversations) accumulate full history, then returns the answer text.
     If `on_event` is given, it is called with a `{"type": "tool_call", ...}` dict
     each time a tool is dispatched (used to stream activity over the WebSocket).
-    If `request_approval` is given, it is a blocking callback `(command) -> bool`
-    consulted before any `root_bash` command runs; when it's absent or returns
-    False, the command is refused and never executed.
+    If `request_approval` is given, it is a blocking callback
+    `(ApprovalRequest) -> ApprovalResult` consulted before any gated tool
+    (`root_bash`, `post`) runs; when it's absent or returns a non-approved result,
+    the action is refused and never executed. The result also carries the admin
+    token the user supplied, which `post` reuses to authenticate its call.
     """
     # Ephemeral retry prompts: sent to the model when it returns an empty answer,
     # but never written into `messages`, so the persisted/rendered history stays
@@ -306,7 +490,7 @@ def _run_loop(messages: list[dict], on_event=None, request_approval=None) -> str
     for _ in range(MAX_STEPS):
         resp = client.chat.completions.create(
             model=MODEL,
-            messages=messages + nudges,
+            messages=_with_memories(messages, conv_id) + nudges,
             tools=TOOLS,
         )
         msg = resp.choices[0].message
@@ -366,12 +550,41 @@ def _run_loop(messages: list[dict], on_event=None, request_approval=None) -> str
                 command = args.get("command", "")
                 if not command.strip():
                     output = "(no command provided)"
+                elif is_safe_command(command):
+                    # Provably read-only — auto-approved, no prompt (see safe_commands).
+                    output = root_bash(command)
                 elif request_approval is None:
                     output = "(root_bash requires interactive approval, unavailable on this path; not executed)"
-                elif request_approval(command):
+                elif request_approval(
+                    ApprovalRequest(kind="bash", summary=command, detail=command)
+                ).approved:
                     output = root_bash(command)
                 else:
                     output = "(command was not approved by the user; not executed)"
+            elif name == "post":
+                path = args.get("path", "")
+                body = args.get("body")
+                if not path.strip():
+                    output = "(no path provided)"
+                elif request_approval is None:
+                    output = "(post requires interactive approval, unavailable on this path; not executed)"
+                else:
+                    detail = f"POST {path}"
+                    if body is not None:
+                        detail += "\n" + json.dumps(body, indent=2)
+                    result = request_approval(
+                        ApprovalRequest(kind="post", summary=f"POST {path}", detail=detail)
+                    )
+                    if result.approved:
+                        output = post_stat(path, body, result.token)
+                    else:
+                        output = "(post was not approved by the user; not executed)"
+            elif name == "save_memory":
+                output = save_memory(args.get("content", ""))
+            elif name == "delete_memory":
+                output = delete_memory(args.get("id"))
+            elif name == "add_conversation_note":
+                output = add_conversation_note(conv_id, args.get("note", ""))
             else:
                 output = f"(unknown tool: {name})"
             messages.append(
@@ -386,7 +599,7 @@ def new_messages() -> list[dict]:
     return [{"role": "system", "content": build_system_prompt()}]
 
 
-def continue_conversation(messages: list[dict], query: str, on_event=None, request_approval=None) -> str:
+def continue_conversation(messages: list[dict], query: str, on_event=None, request_approval=None, conv_id=None) -> str:
     """Append a user turn to an existing conversation and run to an answer."""
     messages.append({"role": "user", "content": query})
-    return _run_loop(messages, on_event, request_approval)
+    return _run_loop(messages, on_event, request_approval, conv_id)

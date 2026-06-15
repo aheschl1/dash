@@ -33,7 +33,7 @@ This keeps the verification logic in one place. Inline curl checks in prompts ge
 
 ## Auth
 
-Mutating endpoints (🔒 in the API table) require an admin token; all GETs and feedback submission stay public. The dashboard renders read-only on load and only prompts for login when a protected action is attempted. The agent's **`root_bash` approval** is likewise admin-gated — approving a command over `WS /api/ws/agent` requires a valid token the server re-verifies (see Backend → Agent → Streaming); denying does not.
+Mutating endpoints (🔒 in the API table) require an admin token; all GETs and feedback submission stay public. The dashboard renders read-only on load and only prompts for login when a protected action is attempted. The agent's **`root_bash` approval** is likewise admin-gated — approving a command over `WS /api/ws/agent` requires a valid token the server re-verifies (see Backend → Agent → Streaming); denying does not. Read-only commands the agent proves safe auto-run without a prompt (see Backend → Agent → `safe_commands.py`).
 
 - **Mechanism:** `backend/auth.py` — PBKDF2-HMAC-SHA256 passwords + HMAC-signed `<payload>.<signature>` tokens, **stdlib only** (no extra deps). Tokens live 24h. The signing secret is generated once and persisted in the `auth_config` table (survives rebuilds).
 - **Create/reset an admin:** `bash scripts/create_admin.sh` (interactive hidden prompt) or `ADMIN_USER=… ADMIN_PASS=… bash scripts/create_admin.sh`. Re-running an existing username resets its password. The container must be running. Passwords are never stored in plaintext or in the compose file.
@@ -87,7 +87,9 @@ string and the rest of the agent still works.
 | File | Role |
 |---|---|
 | `prompt.py` | Builds the system prompt; embeds the live OpenAPI spec (slimmed to GET path + summary) fetched from `127.0.0.1:8000/openapi.json` so the model knows which endpoints exist. |
-| `main.py` | LLM client + tools — `get_stat` (curls a GET on the local API), `web_search` (Tavily, for interpreting what a behavior/process/port/error means; used sparingly), `cat_file`/`ls_folder` (read host files/dirs through an allowlisted path), and **`root_bash`** (runs an arbitrary command as root in the host's namespaces via `nsenter -t 1 -m -u -i -n -p -- bash -c`, 60s timeout via `AGENT_BASH_TIMEOUT`). `root_bash` is **gated by per-command human approval + admin auth**: `_run_loop` takes a `request_approval(command) -> bool` callback and refuses to run anything it doesn't approve (no callback ⇒ refused, so the POST `/api/send` path can never run it — only the WS path supplies one). The system prompt tells the model to avoid `root_bash` unless explicitly asked to take an action and to prefer the read-only tools. — + `_run_loop` (drives tool calls to a final answer). The Qwen3.5 thinking model occasionally burns a whole generation in its `<think>`/`reasoning_content` channel and returns **empty** user-facing content (or "thinks" about a follow-up tool call but never emits it, then stops); `_run_loop` detects an empty answer and re-prompts the model with an **ephemeral nudge** (`EMPTY_NUDGE`, retried up to `AGENT_EMPTY_RETRIES`, default 2) that is sent to the model but **never written into `messages`** — so the persisted/rendered history stays clean. Config via env: `AGENT_LLM_BASE_URL`, `AGENT_LLM_API_KEY` (llama.cpp ignores it; placeholder), `AGENT_MODEL` (default `Qwen_Qwen3.5-9B-Q6_K.gguf` — must match what `/v1/models` reports), `AGENT_MAX_STEPS`, `AGENT_EMPTY_RETRIES`, `AGENT_MAX_CONVERSATIONS`. |
+| `approval.py` | The reusable **`ApprovalGate`** (per running turn) + `ApprovalRequest`/`ApprovalResult` dataclasses. Both gated tools (`root_bash`, `post`) route their per-call human-approval through one gate: it registers a pending approval, dispatches an `approval_request` over the WS, blocks the agent's executor thread on a `threading.Event`, and resolves from the loop thread when the user answers (or times out ⇒ denied). The resolved result carries the verified admin token so `post` can reuse it. |
+| `safe_commands.py` | **`is_safe_command`** — the read-only-command classifier that lets `root_bash` skip the approval prompt for provably read-only commands (`cat`, `ss`, `docker ps`, `journalctl -u …`). Strict **allowlist**, fail-closed: refuses any redirection / command-substitution / backgrounding, then requires every simple command in the pipeline/sequence to be a known read-only binary (pure-read set + per-binary validators for mixed-mode tools like `find`/`docker`/`systemctl`/`ip`/`virsh`). Disable wholesale with `AGENT_BASH_AUTO_APPROVE=0`. Widens nothing the agent couldn't already do unauthenticated — `cat_file`/`ls_folder` already expose root reads with no approval. |
+| `main.py` | LLM client + tools — `get_stat` (curls a GET on the local API), `web_search` (Tavily, for interpreting what a behavior/process/port/error means; used sparingly), `cat_file`/`ls_folder` (read host files/dirs through an allowlisted path), **`post`** (curls a POST to a mutating 🔒 endpoint via `post_stat`, authenticating with the approver's admin token; path restricted to loopback `/api/`), and **`root_bash`** (runs an arbitrary command as root in the host's namespaces via `nsenter -t 1 -m -u -i -n -p -- bash -c`, 60s timeout via `AGENT_BASH_TIMEOUT`). `post` and `root_bash` are both **gated by per-call human approval + admin auth** through the shared `ApprovalGate`: `_run_loop` takes a `request_approval(ApprovalRequest) -> ApprovalResult` callback and refuses to run anything it doesn't approve (no callback ⇒ refused, so the POST `/api/send` path can never run them — only the WS path supplies one). **Exception:** a `root_bash` command that `safe_commands.is_safe_command` proves read-only auto-runs without a prompt (and works on the POST path too, since it needs no approval) — see `safe_commands.py`. The model is told to prefer `post` over `root_bash` whenever the API exposes the action. The system prompt tells the model to avoid `root_bash` unless explicitly asked to take an action and to prefer the read-only tools. — + `_run_loop` (drives tool calls to a final answer). The Qwen3.5 thinking model occasionally burns a whole generation in its `<think>`/`reasoning_content` channel and returns **empty** user-facing content (or "thinks" about a follow-up tool call but never emits it, then stops); `_run_loop` detects an empty answer and re-prompts the model with an **ephemeral nudge** (`EMPTY_NUDGE`, retried up to `AGENT_EMPTY_RETRIES`, default 2) that is sent to the model but **never written into `messages`** — so the persisted/rendered history stays clean. Config via env: `AGENT_LLM_BASE_URL`, `AGENT_LLM_API_KEY` (llama.cpp ignores it; placeholder), `AGENT_MODEL` (default `Qwen_Qwen3.5-9B-Q6_K.gguf` — must match what `/v1/models` reports), `AGENT_MAX_STEPS`, `AGENT_EMPTY_RETRIES`, `AGENT_MAX_CONVERSATIONS`. |
 | `store.py` | Postgres-backed conversation store (`chat_sessions` table) with an in-memory write-through cache. Chats **persist** across restarts/reloads; the DB is the source of truth and cache eviction never loses data. A new conversation is cached but its DB row is written lazily on the first saved turn (empty 'New chat' tabs never persist). Removed only by explicit `end` or the most-recent-N cap (`AGENT_MAX_CONVERSATIONS`, default 200, pruned on save). |
 | `endpoint.py` | The router (mounted via `include_router` in `main.py`) + the `_render` helper that reduces raw messages to user/assistant turns for the UI. |
 
@@ -130,17 +132,21 @@ is open, auto-reconnects with a 1.5s backoff, and subscribes to the active conve
 on every (re)connect and tab switch; `done` for a resumed turn triggers a reload so the
 optimistic pending tail is replaced by the canonical persisted turn.
 
-**root_bash approval (over the same WS).** When the agent calls `root_bash`, the
-blocking loop (on the executor thread) registers a pending approval on the `_Turn`
-and dispatches `{type:approval_request, approval_id, command}`, then blocks on a
+**Gated-tool approval (over the same WS).** When the agent calls a gated tool
+(`root_bash` or `post`), the blocking loop (on the executor thread) goes through the
+turn's `ApprovalGate` (see `approval.py`): it registers a pending approval and
+dispatches `{type:approval_request, approval_id, kind, summary, detail}` (`kind` is
+`bash` or `post`; the UI labels the prompt and shows `detail`), then blocks on a
 `threading.Event` until a reply resolves it or it times out (`AGENT_APPROVAL_TIMEOUT`,
 default 180s ⇒ denied). The client replies `{conv_id, approval_id, approved, token}`.
-**Approving requires a valid admin token** — the server re-verifies it (`auth.verify_token`)
-and, if it's missing/expired, leaves the approval pending and sends `{type:approval_unauthorized}`
-so the UI re-prompts login; **denying needs no auth** (anyone may cancel — the fail-safe
-direction). The frontend gates the Approve button through `runProtected` (login modal +
-replay) and attaches the Bearer token; pending approvals are included in the `resume`
-payload (`approvals:[…]`) so a reconnect re-shows the buttons. Because approval blocks
+**Approving requires a valid admin token** — the server re-verifies it (`auth.verify_token`),
+then passes the token through the gate so `post` can authenticate its loopback call.
+If the token is missing/expired the server leaves the approval pending and sends
+`{type:approval_unauthorized}` so the UI re-prompts login; **denying needs no auth**
+(anyone may cancel — the fail-safe direction). The frontend gates the Approve button
+through `runProtected` (login modal + replay) and attaches the Bearer token; pending
+approvals are included in the `resume` payload (`approvals:[{approval_id,kind,summary,detail}]`)
+so a reconnect re-shows the buttons. Because approval blocks
 inside the turn, the busy claim is held throughout, so a never-answered prompt can't
 double-run and the timeout always releases the worker.
 
@@ -194,6 +200,10 @@ chat_sessions — id (uuid), title, turns, messages (JSONB raw message list), cr
 | GET | `/api/feedback` | Feedback items (optionally `?status=pending`) |
 | POST | `/api/feedback` | Submit feedback (`title`, `description`) |
 | POST | `/api/feedback/{id}/status` | 🔒 Update item status (`status`, `note`) |
+| GET | `/api/memories` | Agent's durable memories (`{memories[]}`) |
+| POST | `/api/memories` | 🔒 Add a memory (`content`) |
+| PUT | `/api/memories/{id}` | 🔒 Edit a memory's content (`content`) |
+| DELETE | `/api/memories/{id}` | 🔒 Delete a memory |
 | POST | `/api/host/reboot` | 🔒 Reboot the host |
 | POST | `/api/newconversation` | Start an agent conversation → `{id}` |
 | POST | `/api/send/{id}` | Add a turn to a conversation (`message`) → `{answer}` (404 if unknown id) |
@@ -235,6 +245,7 @@ components/
   LoginModal.jsx     — admin login (shown only when a protected action needs auth)
   FeedbackModal.jsx  — submit feedback (title + optional description)
   FeedbackPanel.jsx  — read-only display of the feedback queue with statuses
+  MemoriesCard.jsx   — browse/add/edit/delete the agent's durable memories (GET public; mutations admin-gated via runProtected)
   AgentPanel.jsx     — assistant drawer: collapsible right-edge panel (fixed; pushes/squishes the dashboard via right-padding on .app). Active-conversation tabs across the top, standard chat below. Sends over WS /api/ws/agent and renders live tool-dispatch chips as they stream (falls back to POST /api/send on WS failure). Past chats (persisted in `chat_sessions`) load on open and survive reloads — removed only via the per-tab × (DELETE /api/end). Desktop: drag the left edge to resize (width persisted in localStorage). Mobile: overlays instead of squishing.
 ```
 

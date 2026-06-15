@@ -23,6 +23,7 @@ import CronCard from './components/CronCard'
 import DirectoryMenu from './components/DirectoryMenu'
 import FeedbackModal from './components/FeedbackModal'
 import FeedbackPanel from './components/FeedbackPanel'
+import MemoriesCard from './components/MemoriesCard'
 import AddClientModal from './components/AddClientModal'
 import AgentPanel from './components/AgentPanel'
 import AskSelection from './components/AskSelection'
@@ -317,6 +318,9 @@ export default function App() {
         </div>
         <div className="full-width">
           <HistoryChart data={history} window={historyWindow} onWindowChange={setHistoryWindow} />
+        </div>
+        <div className="full-width">
+          <MemoriesCard runProtected={runProtected} />
         </div>
         <div className="full-width">
           <FeedbackPanel />
