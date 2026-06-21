@@ -1,6 +1,15 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import Mermaid, { mermaidSource } from './Mermaid'
+
+// Render fenced ```mermaid blocks as diagrams; everything else as default markdown.
+const MD_COMPONENTS = {
+  pre: ({ node, children, ...props }) => {
+    const mermaid = mermaidSource(children)
+    return mermaid != null ? <Mermaid chart={mermaid} /> : <pre {...props}>{children}</pre>
+  },
+}
 
 const COLS = [
   { key: 'todo', label: 'To investigate' },
@@ -8,10 +17,36 @@ const COLS = [
   { key: 'done', label: 'Resolved' },
 ]
 
-export default function InvestigationBoard({ open, onClose, refreshKey }) {
+const COLLAPSE_KEY = 'board-collapsed-cols'
+
+export default function InvestigationBoard({ open, onClose, refreshKey, onOpenConversation }) {
   const [cards, setCards] = useState([])
   const [dragId, setDragId] = useState(null)
-  const laneRef = useRef(null)
+  // Where the dragged card would land: { col, beforeId } — drives the drop marker.
+  const [over, setOver] = useState(null)
+  // Collapsed status lanes (persisted) + per-card "engorged to full lane width" (session).
+  const [collapsed, setCollapsed] = useState(() => {
+    try { return new Set(JSON.parse(localStorage.getItem(COLLAPSE_KEY) || '[]')) }
+    catch { return new Set() }
+  })
+  const [expanded, setExpanded] = useState(() => new Set())
+
+  const toggleCollapsed = useCallback((col) => {
+    setCollapsed((prev) => {
+      const next = new Set(prev)
+      next.has(col) ? next.delete(col) : next.add(col)
+      try { localStorage.setItem(COLLAPSE_KEY, JSON.stringify([...next])) } catch { /* ignore */ }
+      return next
+    })
+  }, [])
+
+  const toggleExpanded = useCallback((id) => {
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      next.has(id) ? next.delete(id) : next.add(id)
+      return next
+    })
+  }, [])
 
   const load = useCallback(async () => {
     try {
@@ -30,10 +65,12 @@ export default function InvestigationBoard({ open, onClose, refreshKey }) {
   const byCol = (col) =>
     cards.filter((c) => c.col === col).sort((a, b) => a.pos - b.pos)
 
-  // Drop onto a column (optionally before a specific card) → midpoint pos.
+  const clearDrag = useCallback(() => { setDragId(null); setOver(null) }, [])
+
+  // Drop onto a zone (optionally before a specific card) → midpoint pos.
   const drop = useCallback(async (col, beforeId) => {
     const id = dragId
-    setDragId(null)
+    clearDrag()
     if (id == null) return
     const colCards = byCol(col).filter((c) => c.id !== id)
     let idx = colCards.length
@@ -55,7 +92,7 @@ export default function InvestigationBoard({ open, onClose, refreshKey }) {
     } finally {
       load()
     }
-  }, [dragId, cards, load])
+  }, [dragId, cards, load, clearDrag])
 
   const remove = useCallback(async (id) => {
     setCards((cs) => cs.filter((c) => c.id !== id))
@@ -65,21 +102,6 @@ export default function InvestigationBoard({ open, onClose, refreshKey }) {
       load()
     }
   }, [load])
-
-  // Drag the empty lane to pan horizontally.
-  const onLaneDown = useCallback((e) => {
-    const lane = laneRef.current
-    if (!lane || e.target !== lane) return
-    const startX = e.clientX
-    const startScroll = lane.scrollLeft
-    const move = (ev) => { lane.scrollLeft = startScroll - (ev.clientX - startX) }
-    const up = () => {
-      window.removeEventListener('mousemove', move)
-      window.removeEventListener('mouseup', up)
-    }
-    window.addEventListener('mousemove', move)
-    window.addEventListener('mouseup', up)
-  }, [])
 
   if (!open) return null
 
@@ -91,45 +113,92 @@ export default function InvestigationBoard({ open, onClose, refreshKey }) {
         <button className="board-close" onClick={onClose} aria-label="Close">×</button>
       </div>
 
-      <div className="board-lane" ref={laneRef} onMouseDown={onLaneDown}>
-        {COLS.map((col) => (
-          <div
-            className="board-col"
-            key={col.key}
-            onDragOver={(e) => e.preventDefault()}
-            onDrop={(e) => { e.preventDefault(); drop(col.key, null) }}
-          >
-            <div className="board-col-head">
-              {col.label} · {byCol(col.key).length}
-            </div>
-            <div className="board-col-body">
-              {byCol(col.key).map((c) => (
-                <div
-                  className="board-card"
-                  key={c.id}
-                  draggable
-                  onDragStart={() => setDragId(c.id)}
-                  onDragOver={(e) => e.preventDefault()}
-                  onDrop={(e) => { e.stopPropagation(); e.preventDefault(); drop(col.key, c.id) }}
-                >
-                  <div className="board-card-head">
-                    <span className="board-card-src" title={c.source_title || ''}>
-                      {c.source_title || 'pinned'}
-                    </span>
-                    <button
-                      className="board-card-del"
-                      onClick={() => remove(c.id)}
-                      aria-label="Remove"
-                    >×</button>
-                  </div>
-                  <div className="board-card-body agent-md">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{c.content}</ReactMarkdown>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        ))}
+      <div className="board-wall">
+        {COLS.map((col) => {
+          const zoneCards = byCol(col.key)
+          const isOverZone = over?.col === col.key
+          const isCollapsed = collapsed.has(col.key)
+          return (
+            <section
+              className={`board-zone zone-${col.key}${isOverZone ? ' is-over' : ''}${isCollapsed ? ' is-collapsed' : ''}`}
+              key={col.key}
+              onDragOver={(e) => { e.preventDefault(); setOver({ col: col.key, beforeId: null }) }}
+              onDrop={(e) => { e.preventDefault(); drop(col.key, over?.beforeId ?? null) }}
+            >
+              <header
+                className="board-zone-head"
+                onClick={() => toggleCollapsed(col.key)}
+                title={isCollapsed ? 'Expand lane' : 'Collapse lane'}
+              >
+                <span className={`board-zone-chevron${isCollapsed ? ' collapsed' : ''}`}>▾</span>
+                <span className="board-zone-dot" />
+                <span className="board-zone-label">{col.label}</span>
+                <span className="board-zone-count">{zoneCards.length}</span>
+              </header>
+
+              {!isCollapsed && (
+              <div className="board-zone-cards">
+                {zoneCards.length === 0 && (
+                  <div className="board-zone-empty">Drag a card here</div>
+                )}
+                {zoneCards.map((c) => {
+                  const markBefore = isOverZone && over?.beforeId === c.id
+                  const isExpanded = expanded.has(c.id)
+                  return (
+                    <article
+                      className={[
+                        'board-card',
+                        dragId === c.id ? 'dragging' : '',
+                        markBefore ? 'drop-before' : '',
+                        isExpanded ? 'expanded' : '',
+                      ].filter(Boolean).join(' ')}
+                      key={c.id}
+                      draggable
+                      onDragStart={() => setDragId(c.id)}
+                      onDragEnd={clearDrag}
+                      onDragOver={(e) => {
+                        e.preventDefault(); e.stopPropagation()
+                        setOver({ col: col.key, beforeId: c.id })
+                      }}
+                      onDrop={(e) => { e.stopPropagation(); e.preventDefault(); drop(col.key, c.id) }}
+                    >
+                      <div className="board-card-head">
+                        {c.source_conv ? (
+                          <button
+                            className="board-card-src board-card-src-link"
+                            title={`Open conversation: ${c.source_title || ''}`}
+                            onClick={() => onOpenConversation?.(c.source_conv)}
+                          >
+                            {c.source_title || 'pinned'}
+                          </button>
+                        ) : (
+                          <span className="board-card-src" title={c.source_title || ''}>
+                            {c.source_title || 'pinned'}
+                          </span>
+                        )}
+                        <button
+                          className="board-card-expand"
+                          onClick={() => toggleExpanded(c.id)}
+                          aria-label={isExpanded ? 'Shrink' : 'Expand'}
+                          title={isExpanded ? 'Shrink' : 'Expand'}
+                        >{isExpanded ? '⤡' : '⤢'}</button>
+                        <button
+                          className="board-card-del"
+                          onClick={() => remove(c.id)}
+                          aria-label="Remove"
+                        >×</button>
+                      </div>
+                      <div className="board-card-body agent-md">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>{c.content}</ReactMarkdown>
+                      </div>
+                    </article>
+                  )
+                })}
+              </div>
+              )}
+            </section>
+          )
+        })}
       </div>
     </div>
   )

@@ -1,6 +1,7 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo, memo } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import Mermaid, { mermaidSource } from './Mermaid'
 import { getToken, clearToken } from '../auth'
 
 const WIDTH_KEY = 'agentWidth'
@@ -45,7 +46,7 @@ const MD_COMPONENTS = {
 // `code`) and tables. The pinned source is recovered by slicing the original
 // message text via the node's remark position offsets — exact verbatim markdown,
 // more faithful than rebuilding a table from the AST. Used only on answer bubbles.
-const makeMdComponents = (rawContent, onPin) => {
+const makeMdComponents = (rawContent, onPin, streaming) => {
   const pinButton = (kind) => (node) => {
     const p = node?.position
     if (!p || !onPin) return null
@@ -60,12 +61,17 @@ const makeMdComponents = (rawContent, onPin) => {
   }
   return {
     ...MD_COMPONENTS,
-    pre: ({ node, children, ...props }) => (
-      <div className="pinnable">
-        {pinButton('code')(node)}
-        <pre {...props}>{children}</pre>
-      </div>
-    ),
+    pre: ({ node, children, ...props }) => {
+      // Don't try to render a diagram from a half-streamed (and so usually invalid)
+      // source — show it as plain code until the turn finalizes, then it renders once.
+      const mermaid = streaming ? null : mermaidSource(children)
+      return (
+        <div className="pinnable">
+          {pinButton('code')(node)}
+          {mermaid != null ? <Mermaid chart={mermaid} /> : <pre {...props}>{children}</pre>}
+        </div>
+      )
+    },
     table: ({ node, children, ...props }) => (
       <div className="pinnable">
         {pinButton('table')(node)}
@@ -75,11 +81,27 @@ const makeMdComponents = (rawContent, onPin) => {
   }
 }
 
+// One rendered answer bubble. Memoized on (content, streaming) so an unrelated
+// parent re-render (the dashboard polls every few seconds) doesn't rebuild the
+// markdown component map — which, by handing ReactMarkdown a fresh `pre` identity,
+// would remount and re-render every embedded Mermaid diagram and make them flicker.
+const AssistantBubble = memo(function AssistantBubble({ content, streaming, onPin }) {
+  const components = useMemo(
+    () => makeMdComponents(content, onPin, streaming),
+    [content, streaming, onPin],
+  )
+  return (
+    <div className="agent-msg agent-msg-assistant agent-md">
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>{content}</ReactMarkdown>
+    </div>
+  )
+})
+
 // Right-edge assistant drawer. Collapsed it's a thin rail; expanded it pushes the
 // dashboard left (via padding on .app). The top row lists past conversations
 // (persisted in Postgres); each is a standard chat. Chats survive reloads and
 // restarts — they're removed only by the explicit delete (×) button.
-export default function AgentPanel({ open, setOpen, runProtected, pendingContext, clearPendingContext, onPinned }) {
+export default function AgentPanel({ open, setOpen, runProtected, pendingContext, clearPendingContext, openConvId, clearOpenConv, onPinned }) {
   const [conversations, setConversations] = useState([])
   const [activeId, setActiveId] = useState(null)
   const [messages, setMessages] = useState([])
@@ -173,6 +195,9 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
     ;(async () => {
       const cs = await loadConversations()
       if (cancelled) return
+      // A specific conversation was requested (board card) — let that effect pick
+      // it rather than defaulting to the first tab.
+      if (openConvId != null && cs.some(c => c.id === openConvId)) return
       if (cs.length === 0) {
         newConversation()
       } else {
@@ -230,6 +255,23 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
     setActiveId(id)
     loadMessages(id)
   }, [loadMessages])
+
+  // Open a specific conversation requested from elsewhere (a board card's source).
+  // Ensure the conversation list is loaded so the requested tab exists, then select
+  // it; loadMessages handles the case where it was since deleted (404).
+  useEffect(() => {
+    if (!open || openConvId == null) return
+    let cancelled = false
+    ;(async () => {
+      let cs = conversations
+      if (!cs.some(c => c.id === openConvId)) cs = await loadConversations()
+      if (cancelled) return
+      if (cs.some(c => c.id === openConvId)) selectConversation(openConvId)
+      clearOpenConv()
+    })()
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, openConvId])
 
   const deleteConversation = useCallback(async (id) => {
     try { await fetch(`/api/end/${id}`, { method: 'DELETE' }) } catch {}
@@ -449,7 +491,6 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
   if (!open) {
     return (
       <button className="agent-rail" onClick={() => setOpen(true)} title="Open assistant" aria-label="Open assistant">
-        <span className="agent-rail-icon">💬</span>
         <span className="agent-rail-text">Assistant</span>
       </button>
     )
@@ -519,9 +560,7 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
             </div>
           )
           if (m.role === 'assistant') return (
-            <div key={i} className="agent-msg agent-msg-assistant agent-md">
-              <ReactMarkdown remarkPlugins={[remarkGfm]} components={makeMdComponents(m.content, pinBlock)}>{m.content}</ReactMarkdown>
-            </div>
+            <AssistantBubble key={i} content={m.content} streaming={m.streaming} onPin={pinBlock} />
           )
           return <div key={i} className={`agent-msg agent-msg-${m.role}`}>{m.content}</div>
         })}

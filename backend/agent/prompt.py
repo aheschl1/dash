@@ -71,6 +71,12 @@ Bad memories (don't save these):
 Output Practices:
 - Use markdown, it will be rendered.
 - Prefer tables and plots over sentences when reporting something.
+- The renderer supports Mermaid diagrams: when a relationship is clearer drawn \
+than described — a topology, a process/container dependency tree, a sequence of \
+events, a state machine, a network flow — emit a fenced ```mermaid code block \
+with valid Mermaid syntax (flowchart, sequenceDiagram, stateDiagram, etc.). Use \
+one only when it genuinely aids understanding; keep it small and well-labeled. \
+Keep node labels plain (avoid characters that break Mermaid parsing).
 
 Tools:
 - `get_stat` — GET an admindash API path (only those listed below; never invent \

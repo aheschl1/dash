@@ -852,7 +852,7 @@ tr:hover td { background: var(--surface2); }
 /* ── Assistant drawer ─────────────────────────────────────────────────────────
    Fixed to the right edge; the dashboard is pushed left (squished) by padding on
    .app, so the grid cards shrink rather than slide under the panel. */
-.app { transition: padding-right 0.18s ease; }
+.app { transition: padding-right 0.18s ease; padding-left: 34px; }
 .app.agent-collapsed { padding-right: 34px; }
 .app.agent-open { padding-right: var(--agent-width, 380px); }
 /* While dragging the panel edge, kill the transition so resize tracks the cursor. */
@@ -1058,12 +1058,34 @@ body.agent-resizing .agent-resize::after { background: var(--accent); }
 .pinnable:hover .pin-btn { opacity: 1; }
 .pin-btn:hover { border-color: var(--accent); }
 
-.board-header-btn {
-  background: var(--surface2); border: 1px solid var(--border); border-radius: 4px;
-  color: var(--text-muted); font-size: 12px; padding: 3px 10px; cursor: pointer;
-  white-space: nowrap; transition: color 0.15s, border-color 0.15s;
+/* Full-height left-edge rail that opens the investigation board, mirroring the
+   assistant's right-edge rail. Shown only while the board is closed; the .app
+   reserves space for it with padding-left so it never overlaps content. */
+.board-rail {
+  position: fixed;
+  top: 0; left: 0; bottom: 0;
+  width: 34px;
+  z-index: 30;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  color: var(--text-muted);
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0;
 }
-.board-header-btn:hover { color: var(--text); border-color: var(--text-muted); }
+.board-rail:hover { color: var(--accent); background: var(--surface2); }
+.board-rail-text {
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
 
 /* ── Investigation board overlay ────────────────────────────────────────────── */
 /* Sits below the real header (so its logo/hamburger/auth/Investigation-toggle
@@ -1074,67 +1096,161 @@ body.agent-resizing .agent-resize::after { background: var(--accent); }
   position: fixed;
   top: var(--header-height); left: 0; right: 0; bottom: 0;
   z-index: 50;
-  background: var(--bg); display: flex; flex-direction: column;
+  background: rgba(13, 17, 23, 0.45);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  display: flex; flex-direction: column;
   animation: board-in 0.2s ease-out;
 }
+/* Stop the board at the assistant drawer's left edge so the chat is never
+   covered — the board squishes alongside it, mirroring how .app is padded. */
+.app.agent-open .board-overlay { right: var(--agent-width, 380px); }
+.app.agent-collapsed .board-overlay { right: 34px; }
 @keyframes board-in {
   from { transform: translateX(-100%); }
   to { transform: translateX(0); }
 }
 .board-head {
   display: flex; align-items: center; gap: 12px;
-  padding: 12px 16px; border-bottom: 1px solid var(--border);
+  padding: 14px 22px; border-bottom: 1px solid var(--border);
 }
-.board-title { font-weight: 600; }
-.board-count { color: var(--text-muted); font-size: 12px; }
+.board-title { font-weight: 600; font-size: 15px; letter-spacing: 0.2px; }
+.board-count {
+  color: var(--text-muted); font-size: 11px; font-weight: 600;
+  padding: 3px 9px; border-radius: 999px;
+  background: var(--surface2); border: 1px solid var(--border);
+}
 .board-close {
   margin-left: auto; background: none; border: 0; color: var(--text-muted);
-  font-size: 22px; line-height: 1; cursor: pointer;
+  font-size: 22px; line-height: 1; cursor: pointer; transition: color 0.15s;
 }
 .board-close:hover { color: var(--text); }
 
-.board-lane {
-  flex: 1; display: flex; gap: var(--gap); align-items: flex-start;
-  padding: var(--gap); overflow-x: auto; overflow-y: hidden; cursor: grab;
+/* Vertical stack of status lanes; each lane flows its cards as a variable-width
+   masonry wall (flex-wrap, content-sized). The whole wall scrolls vertically. */
+.board-wall {
+  flex: 1; display: flex; flex-direction: column; gap: 18px;
+  padding: 20px 22px 40px; overflow-y: auto; overflow-x: hidden;
 }
-.board-lane:active { cursor: grabbing; }
-.board-col {
-  flex: 0 0 320px; max-height: 100%; display: flex; flex-direction: column;
-  background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--radius);
+.board-zone {
+  display: flex; flex-direction: column; gap: 12px;
+  padding: 4px; border-radius: var(--radius);
+  transition: background 0.15s, box-shadow 0.15s;
 }
-.board-col-head {
-  padding: 10px var(--pad); font-size: 13px; font-weight: 600;
-  border-bottom: 1px solid var(--border); color: var(--text-muted);
+.board-zone.is-over {
+  background: rgba(88, 166, 255, 0.05);
+  box-shadow: inset 0 0 0 1px rgba(88, 166, 255, 0.35);
 }
-.board-col-body {
-  padding: var(--gap); overflow-y: auto; display: flex; flex-direction: column;
-  gap: var(--gap); min-height: 60px;
+.board-zone-head {
+  display: flex; align-items: center; gap: 9px;
+  padding: 4px 6px; position: sticky; top: 0;
+  cursor: pointer; user-select: none; border-radius: 6px;
+  transition: background 0.15s;
 }
-.board-card {
+.board-zone-head:hover { background: var(--surface2); }
+.board-zone-chevron {
+  color: var(--text-muted); font-size: 11px; line-height: 1;
+  transition: transform 0.15s; flex: none;
+}
+.board-zone-chevron.collapsed { transform: rotate(-90deg); }
+.board-zone-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--text-muted); flex: none;
+}
+.zone-todo .board-zone-dot { background: var(--accent); }
+.zone-looking .board-zone-dot { background: var(--yellow); }
+.zone-done .board-zone-dot { background: var(--green); }
+.board-zone-label {
+  font-size: 13px; font-weight: 600; color: var(--text);
+  letter-spacing: 0.2px;
+}
+.board-zone-count {
+  font-size: 11px; font-weight: 600; color: var(--text-muted);
+  padding: 1px 8px; border-radius: 999px;
   background: var(--surface2); border: 1px solid var(--border);
-  border-radius: var(--radius); cursor: grab;
+}
+.board-zone-cards {
+  display: flex; flex-wrap: wrap; align-items: flex-start; gap: 14px;
+  align-content: flex-start; min-height: 72px;
+  padding: 4px; border-radius: var(--radius);
+}
+.board-zone-empty {
+  display: flex; align-items: center; justify-content: center;
+  width: 100%; min-height: 64px; color: var(--text-muted); font-size: 12px;
+  border: 1px dashed var(--border); border-radius: var(--radius);
+}
+
+/* Cards size to their content between a sensible min and max, so a one-liner
+   stays compact while a wide table/code block claims the room it needs. */
+.board-card {
+  flex: 0 1 auto;
+  width: fit-content; min-width: 220px; max-width: min(620px, 100%);
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; cursor: grab; overflow: hidden;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+  transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+}
+.board-card:hover {
+  transform: translateY(-2px); border-color: #3d4654;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.45);
 }
 .board-card:active { cursor: grabbing; }
+.board-card.dragging {
+  opacity: 0.45; transform: scale(0.98); box-shadow: none;
+}
+/* Engorged: claim a full lane row so neighbouring cards wrap out of the way. */
+.board-card.expanded {
+  flex: 1 0 100%; width: 100%; max-width: 100%;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  border-color: var(--accent);
+}
+.board-card.expanded:hover { transform: none; }
+/* Drop marker: accent bar on the leading edge of the card being targeted. */
+.board-card.drop-before { box-shadow: -6px 0 0 -2px var(--accent), 0 1px 2px rgba(0, 0, 0, 0.3); }
 .board-card-head {
   display: flex; align-items: center; gap: 8px;
-  padding: 6px 10px; border-bottom: 1px solid var(--border);
+  padding: 8px 12px; border-bottom: 1px solid var(--border);
+  background: var(--surface2);
 }
 .board-card-src {
-  font-size: 11px; color: var(--text-muted);
+  font-size: 11px; color: var(--text-muted); font-weight: 500;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.board-card-del {
+button.board-card-src-link {
+  background: none; border: 0; padding: 0; text-align: left;
+  max-width: 100%; cursor: pointer;
+}
+button.board-card-src-link:hover { color: var(--accent); text-decoration: underline; }
+.board-card-expand {
   margin-left: auto; background: none; border: 0; color: var(--text-muted);
-  font-size: 16px; line-height: 1; cursor: pointer;
+  font-size: 14px; line-height: 1; cursor: pointer; transition: color 0.15s;
+  flex: none;
+}
+.board-card-expand:hover { color: var(--accent); }
+.board-card-del {
+  background: none; border: 0; color: var(--text-muted);
+  font-size: 16px; line-height: 1; cursor: pointer; transition: color 0.15s;
+  flex: none;
 }
 .board-card-del:hover { color: var(--red); }
-.board-card-body { padding: 10px; overflow-x: auto; }
+.board-card-body { padding: 12px 14px; overflow-x: auto; }
 .board-card-body > :last-child { margin-bottom: 0; }
 
 @media (max-width: 640px) {
-  .board-col { flex-basis: 80vw; }
+  .board-wall { padding: 16px 14px 32px; }
+  .board-card { min-width: 0; max-width: 100%; width: 100%; }
 }
+.mermaid-diagram {
+  display: flex; justify-content: center;
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 12px; margin: 8px 0; overflow-x: auto;
+}
+.mermaid-diagram svg { max-width: 100%; height: auto; }
+.mermaid-loading { color: var(--text-muted); font-size: 12px; justify-content: flex-start; }
+.mermaid-error {
+  border-color: var(--red); color: var(--text);
+}
+
 .agent-md th { background: var(--surface); }
 .agent-md hr { border: 0; border-top: 1px solid var(--border); margin: 10px 0; }
 .agent-md img { max-width: 100%; }
@@ -1320,23 +1436,38 @@ body.agent-resizing .agent-resize::after { background: var(--accent); }
    single column. Reclaim the full width — collapsed shows a floating button,
    open is a fullscreen sheet dismissed with the › control in the header. */
 @media (max-width: 640px) {
+  .app { padding-left: 0; }
   .app.agent-collapsed,
   .app.agent-open { padding-right: 0; }
+  .app.agent-collapsed .board-overlay,
+  .app.agent-open .board-overlay { right: 0; }
+
+  .board-rail {
+    top: auto;
+    bottom: 16px;
+    left: 16px;
+    width: auto; height: auto;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.45);
+    padding: 8px 14px;
+    flex-direction: row;
+  }
+  .board-rail .board-rail-text { writing-mode: horizontal-tb; transform: none; }
 
   .agent-rail {
     top: auto;
     bottom: 16px;
     right: 16px;
-    width: 52px;
-    height: 52px;
+    width: auto; height: auto;
     border: 1px solid var(--border);
-    border-radius: 50%;
+    border-radius: 999px;
     box-shadow: 0 3px 10px rgba(0, 0, 0, 0.45);
     flex-direction: row;
     gap: 0;
+    padding: 8px 14px;
   }
-  .agent-rail-icon { font-size: 24px; }
-  .agent-rail-text { display: none; }
+  .agent-rail .agent-rail-text { writing-mode: horizontal-tb; transform: none; }
 
   .agent-panel { width: 100%; max-width: none; }
   .agent-resize { display: none; }

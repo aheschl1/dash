@@ -79,6 +79,7 @@ export default function App() {
   const [boardOpen, setBoardOpen] = useState(false)
   const [boardRefresh, setBoardRefresh] = useState(0)
   const [askContext, setAskContext] = useState(null)
+  const [openConv, setOpenConv] = useState(null)
   const [authUser, setAuthUser] = useState(currentUser())
   const pendingAction = useRef(null)
   const headerRef = useRef(null)
@@ -284,9 +285,6 @@ export default function App() {
               <button className="logout-btn" onClick={logout} title="Log out">logout</button>
             </span>
           )}
-          <button className="board-header-btn" onClick={() => setBoardOpen(true)}>
-            Investigation
-          </button>
           <button className="feedback-header-btn" onClick={() => setFeedbackOpen(true)}>
             Feedback
           </button>
@@ -358,13 +356,27 @@ export default function App() {
         runProtected={runProtected}
         pendingContext={askContext}
         clearPendingContext={() => setAskContext(null)}
+        openConvId={openConv}
+        clearOpenConv={() => setOpenConv(null)}
         onPinned={() => { setBoardRefresh(n => n + 1); setBoardOpen(true) }}
       />
+
+      {!boardOpen && (
+        <button
+          className="board-rail"
+          onClick={() => setBoardOpen(true)}
+          title="Open investigation board"
+          aria-label="Open investigation board"
+        >
+          <span className="board-rail-text">Investigation</span>
+        </button>
+      )}
 
       <InvestigationBoard
         open={boardOpen}
         onClose={() => setBoardOpen(false)}
         refreshKey={boardRefresh}
+        onOpenConversation={(id) => { setOpenConv(id); setAgentOpen(true) }}
       />
 
       <AskSelection onAsk={(text) => { setAskContext(text); setAgentOpen(true) }} />
