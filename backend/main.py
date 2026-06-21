@@ -10,10 +10,12 @@ import auth
 from db import (init_db, insert_snapshot, query_history, insert_event, query_events,
                insert_feedback, list_feedback, update_feedback_status,
                get_auth_secret, get_user, set_password,
-               memory_list, memory_save, memory_update, memory_delete)
+               memory_list, memory_save, memory_update, memory_delete,
+               reflection_run_list)
 from collectors import system, gpu, temps, containers, ports, wireguard, disk, processes, network, connections
 from collectors import events as events_collector, smart, alerts, sessions, hardware, vms, cron, directory, vpn
 from agent import router as agent_router
+from agent.reflect import run_nightly_reflection
 
 
 def _collect_and_store() -> None:
@@ -43,7 +45,12 @@ async def lifespan(app: FastAPI):
         lambda: events_collector.poll_and_store(insert_event),
         "interval", seconds=15, id="events"
     )
+    scheduler.add_job(
+        run_nightly_reflection, "cron", hour=0, minute=0,
+        id="reflect", max_instances=1, misfire_grace_time=3600,
+    )
     scheduler.start()
+    app.state.scheduler = scheduler
     _collect_and_store()
     events_collector.poll_and_store(insert_event)
     yield
@@ -178,6 +185,19 @@ def container_action(name: str, action: str = Body(..., embed=True), user: dict 
         return {"name": name, "action": action, "status": c.status}
     except docker_sdk.errors.NotFound:
         return JSONResponse(status_code=404, content={"error": "Not found"})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/api/containers/{name}/stats")
+def get_container_stats(name: str):
+    """Granular live resource stats for one container: host-CPU%, memory (usage,
+    limit, page-cache, app load, %), and cumulative network + block I/O byte
+    totals. A single snapshot — difference two reads for network/block rates."""
+    try:
+        return containers.stats(name)
+    except docker_sdk.errors.NotFound:
+        return JSONResponse(status_code=404, content={"error": f"Container '{name}' not found"})
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
@@ -367,5 +387,29 @@ def remove_memory(id: int, user: dict = Depends(require_admin)):
     if not memory_delete(id):
         return JSONResponse(status_code=404, content={"error": "unknown memory"})
     return {"deleted": id}
+
+
+@app.get("/api/jobs")
+def get_jobs():
+    """Scheduled APScheduler jobs and their next fire time (public, read-only)."""
+    sched = getattr(app.state, "scheduler", None)
+    if sched is None:
+        return {"jobs": []}
+    jobs = []
+    for j in sched.get_jobs():
+        nrt = j.next_run_time
+        jobs.append({
+            "id": j.id,
+            "name": j.name,
+            "trigger": str(j.trigger),
+            "next_run_time": nrt.isoformat() if nrt else None,
+        })
+    return {"jobs": jobs}
+
+
+@app.get("/api/reflection-runs")
+def get_reflection_runs():
+    """Audit log of the nightly self-reflection job (public, read-only)."""
+    return {"runs": reflection_run_list()}
 
 

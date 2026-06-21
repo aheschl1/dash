@@ -58,7 +58,7 @@ Each collector has a `collect()` function. The host network/mount namespace is a
 | `vms.py` | `nsenter --mount=/proc/1/ns/mnt --net=/proc/1/ns/net -- virsh -c qemu:///system` | libvirt VMs: state, vCPUs, memory (balloon), host RSS, per-VM CPU% (rate of cumulative `cpu.time`) |
 | `gpu.py` | `nvidia-smi` subprocess | util%, temp, VRAM, processes |
 | `temps.py` | `sensors -j` | CPU Tctl, NVMe temps |
-| `containers.py` | Docker SDK | name, status, health, ports |
+| `containers.py` | Docker SDK | `collect()`: name, status, health, ports. `stats(name)`: per-container host-CPU% (Docker delta formula), memory (usage/limit/cache/app-load, cgroup v1+v2), cumulative net + block I/O |
 | `ports.py` | `nsenter --net=/proc/1/ns/net -- ss -tlnp` | host open TCP ports (listening) |
 | `connections.py` | conntrack via `pyroute2` netlink (run in host netns through `conntrack_helper.py`); falls back to `ss -tunap` | every tracked flow (incl. UDP + NAT/forwarded) src→dst; enriches process via `ss`, classifies scope (public/private/loopback) |
 | `wireguard.py` | `nsenter --net=/proc/1/ns/net -- wg show` | wg0 interface + peers |
@@ -86,10 +86,11 @@ string and the rest of the agent still works.
 
 | File | Role |
 |---|---|
-| `prompt.py` | Builds the system prompt; embeds the live OpenAPI spec (slimmed to GET path + summary) fetched from `127.0.0.1:8000/openapi.json` so the model knows which endpoints exist. |
+| `prompt.py` | Builds the system prompt. `build_system_prompt` returns **static** instructions only (persisted as `messages[0]`). The dynamic chunks — host facts + the live OpenAPI spec (slimmed to GET/POST path + summary, fetched from `127.0.0.1:8000/openapi.json`) via `build_runtime_context`, plus memories (`build_memory_block`) and per-conversation notes (`build_conversation_notes_block`) — are **injected fresh per run** by `main._with_memories`, never baked into the persisted prompt, so a deploy that changes endpoints (or a new memory) is reflected in every conversation, old and new. `build_runtime_context` is cached per process (it changes only across deploys), so the fetch + host `nsenter` calls don't repeat on every LLM call inside the loop. |
+| `cancel.py` | **`CancelToken`** (a thread-safe one-way stop flag tripped from the loop thread, polled by the agent's executor thread) + the `TurnCanceled` exception the loop raises to unwind at the next safe boundary. |
 | `approval.py` | The reusable **`ApprovalGate`** (per running turn) + `ApprovalRequest`/`ApprovalResult` dataclasses. Both gated tools (`root_bash`, `post`) route their per-call human-approval through one gate: it registers a pending approval, dispatches an `approval_request` over the WS, blocks the agent's executor thread on a `threading.Event`, and resolves from the loop thread when the user answers (or times out ⇒ denied). The resolved result carries the verified admin token so `post` can reuse it. |
 | `safe_commands.py` | **`is_safe_command`** — the read-only-command classifier that lets `root_bash` skip the approval prompt for provably read-only commands (`cat`, `ss`, `docker ps`, `journalctl -u …`). Strict **allowlist**, fail-closed: refuses any redirection / command-substitution / backgrounding, then requires every simple command in the pipeline/sequence to be a known read-only binary (pure-read set + per-binary validators for mixed-mode tools like `find`/`docker`/`systemctl`/`ip`/`virsh`). Disable wholesale with `AGENT_BASH_AUTO_APPROVE=0`. Widens nothing the agent couldn't already do unauthenticated — `cat_file`/`ls_folder` already expose root reads with no approval. |
-| `main.py` | LLM client + tools — `get_stat` (curls a GET on the local API), `web_search` (Tavily, for interpreting what a behavior/process/port/error means; used sparingly), `cat_file`/`ls_folder` (read host files/dirs through an allowlisted path), **`post`** (curls a POST to a mutating 🔒 endpoint via `post_stat`, authenticating with the approver's admin token; path restricted to loopback `/api/`), and **`root_bash`** (runs an arbitrary command as root in the host's namespaces via `nsenter -t 1 -m -u -i -n -p -- bash -c`, 60s timeout via `AGENT_BASH_TIMEOUT`). `post` and `root_bash` are both **gated by per-call human approval + admin auth** through the shared `ApprovalGate`: `_run_loop` takes a `request_approval(ApprovalRequest) -> ApprovalResult` callback and refuses to run anything it doesn't approve (no callback ⇒ refused, so the POST `/api/send` path can never run them — only the WS path supplies one). **Exception:** a `root_bash` command that `safe_commands.is_safe_command` proves read-only auto-runs without a prompt (and works on the POST path too, since it needs no approval) — see `safe_commands.py`. The model is told to prefer `post` over `root_bash` whenever the API exposes the action. The system prompt tells the model to avoid `root_bash` unless explicitly asked to take an action and to prefer the read-only tools. — + `_run_loop` (drives tool calls to a final answer). The Qwen3.5 thinking model occasionally burns a whole generation in its `<think>`/`reasoning_content` channel and returns **empty** user-facing content (or "thinks" about a follow-up tool call but never emits it, then stops); `_run_loop` detects an empty answer and re-prompts the model with an **ephemeral nudge** (`EMPTY_NUDGE`, retried up to `AGENT_EMPTY_RETRIES`, default 2) that is sent to the model but **never written into `messages`** — so the persisted/rendered history stays clean. Config via env: `AGENT_LLM_BASE_URL`, `AGENT_LLM_API_KEY` (llama.cpp ignores it; placeholder), `AGENT_MODEL` (default `Qwen_Qwen3.5-9B-Q6_K.gguf` — must match what `/v1/models` reports), `AGENT_MAX_STEPS`, `AGENT_EMPTY_RETRIES`, `AGENT_MAX_CONVERSATIONS`. |
+| `main.py` | LLM client + tools — `get_stat` (curls a GET on the local API), `web_search` (Tavily, for interpreting what a behavior/process/port/error means; used sparingly), `cat_file`/`ls_folder` (read host files/dirs through an allowlisted path), **`post`** (curls a POST to a mutating 🔒 endpoint via `post_stat`, authenticating with the approver's admin token; path restricted to loopback `/api/`), and **`root_bash`** (runs an arbitrary command as root in the host's namespaces via `nsenter -t 1 -m -u -i -n -p -- bash -c`, 60s timeout via `AGENT_BASH_TIMEOUT`). `post` and `root_bash` are both **gated by per-call human approval + admin auth** through the shared `ApprovalGate`: `_run_loop` takes a `request_approval(ApprovalRequest) -> ApprovalResult` callback and refuses to run anything it doesn't approve (no callback ⇒ refused, so the POST `/api/send` path can never run them — only the WS path supplies one). **Exception:** a `root_bash` command that `safe_commands.is_safe_command` proves read-only auto-runs without a prompt (and works on the POST path too, since it needs no approval) — see `safe_commands.py`. The model is told to prefer `post` over `root_bash` whenever the API exposes the action. The system prompt tells the model to avoid `root_bash` unless explicitly asked to take an action and to prefer the read-only tools. — + `_run_loop` (drives tool calls to a final answer; each completion runs through `_stream_completion` in **streaming mode** and is checked against the turn's `CancelToken` at the top of every step and between chunks, so a turn can be stopped mid-generation — see `cancel.py` and Backend → Agent → Cancellation). The Qwen3.5 thinking model occasionally burns a whole generation in its `<think>`/`reasoning_content` channel and returns **empty** user-facing content (or "thinks" about a follow-up tool call but never emits it, then stops); `_run_loop` detects an empty answer and re-prompts the model with an **ephemeral nudge** (`EMPTY_NUDGE`, retried up to `AGENT_EMPTY_RETRIES`, default 2) that is sent to the model but **never written into `messages`** — so the persisted/rendered history stays clean. Config via env: `AGENT_LLM_BASE_URL`, `AGENT_LLM_API_KEY` (llama.cpp ignores it; placeholder), `AGENT_MODEL` (default `Qwen_Qwen3.5-9B-Q6_K.gguf` — must match what `/v1/models` reports), `AGENT_MAX_STEPS`, `AGENT_EMPTY_RETRIES`, `AGENT_MAX_CONVERSATIONS`. |
 | `store.py` | Postgres-backed conversation store (`chat_sessions` table) with an in-memory write-through cache. Chats **persist** across restarts/reloads; the DB is the source of truth and cache eviction never loses data. A new conversation is cached but its DB row is written lazily on the first saved turn (empty 'New chat' tabs never persist). Removed only by explicit `end` or the most-recent-N cap (`AGENT_MAX_CONVERSATIONS`, default 200, pruned on save). |
 | `endpoint.py` | The router (mounted via `include_router` in `main.py`) + the `_render` helper that reduces raw messages to user/assistant turns for the UI. |
 
@@ -104,9 +105,17 @@ chats on page close. The model's tool calls require llama.cpp running with `--ji
 
 **Streaming (WebSocket):** `POST /api/send/{id}` returns only the final answer.
 `WS /api/ws/agent` additionally streams a `tool_call` event as each tool is
-dispatched, so the UI can show tools live. The blocking agent loop runs in a
-threadpool; `_run_loop`'s `on_event` callback bridges events back to the event
-loop via a queue (see `endpoint.py`). Tool calls **are persisted**: the full raw
+dispatched, plus **live token deltas** (`reasoning_delta`/`answer_delta`) as the
+model generates — `_stream_completion` (which already runs `stream=True` for
+cancellation) forwards each content/reasoning fragment through the same `on_event`
+callback. The UI reassembles the deltas into one growing bubble, then the
+authoritative full `reasoning`/`answer` event for the step finalizes it. The deltas
+are **display-only**: they are not buffered for resume and not persisted (the
+`reasoning`/`answer` events and the saved message list are the source of truth), so a
+reconnect mid-generation skips the partial text and the `done` reload restores the
+canonical turn. The blocking agent loop runs in a threadpool; `_run_loop`'s
+`on_event` callback bridges events back to the event loop via a queue (see
+`endpoint.py`). Tool calls **are persisted**: the full raw
 message list (assistant `tool_calls` + `role:tool` results) is saved to
 `chat_sessions`, and `_render` surfaces each stored tool_call as the same
 `name arg` chip the WS streams live, so a reloaded conversation
@@ -131,6 +140,19 @@ the in-progress turn, then receives the remaining live events + `answer`/`done`)
 is open, auto-reconnects with a 1.5s backoff, and subscribes to the active conversation
 on every (re)connect and tab switch; `done` for a resumed turn triggers a reload so the
 optimistic pending tail is replaced by the canonical persisted turn.
+
+**Cancellation.** The LLM completion runs in **streaming mode** (`_stream_completion`
+in `main.py` — `stream=True`, reassembling the deltas back into one message) purely so
+a long generation can be aborted mid-flight rather than only between steps. Each turn
+owns a `CancelToken` (`cancel.py`); the agent loop checks it at the top of every step
+and between stream chunks. A client sends `{conv_id, cancel:true}` over the WS (needs no
+auth — cancelling is the fail-safe direction, like denying an approval); the WS handler
+trips the token and `gate.cancel_all()` denies any pending approval so a turn parked on a
+prompt also unwinds. The loop raises `TurnCanceled` at the next **safe boundary** (a
+clean user turn or a complete set of tool results — an in-flight tool runs to completion
+first, so the message list stays valid), `_run_turn` persists the partial turn and emits
+`{type:canceled}` then `done`. The Stop button replaces Send in `AgentPanel` while a turn
+is in flight.
 
 **Gated-tool approval (over the same WS).** When the agent calls a gated tool
 (`root_bash` or `post`), the blocking loop (on the executor thread) goes through the
@@ -183,6 +205,7 @@ chat_sessions — id (uuid), title, turns, messages (JSONB raw message list), cr
 | GET | `/api/temps` | CPU/NVMe temperatures |
 | GET | `/api/containers` | Docker containers list |
 | POST | `/api/containers/{name}/action` | 🔒 start/stop/restart |
+| GET | `/api/containers/{name}/stats` | Granular live stats for one container: host-CPU%, memory (usage/limit/cache/app-load/%), cumulative network + block I/O byte totals (404 if unknown) |
 | GET | `/api/logs/{name}` | Container logs |
 | GET | `/api/ports` | Host open TCP ports (listening) |
 | GET | `/api/connections` | All tracked network flows (conntrack) + per-proto/scope counts |
@@ -210,7 +233,7 @@ chat_sessions — id (uuid), title, turns, messages (JSONB raw message list), cr
 | GET | `/api/conversations` | Active conversation ids (+ title preview, turn count) |
 | GET | `/api/conversations/{id}` | Renderable user/assistant turns for one conversation |
 | DELETE | `/api/end/{id}` | Retire a conversation → `{ended}` |
-| WS | `/api/ws/agent` | Send `{conv_id, message}`; streams `{type:tool_call,name,args}` per dispatched tool, then `{type:answer,content}`, then `{type:done}` (or `{type:error}`). Every event carries `conv_id`. |
+| WS | `/api/ws/agent` | Send `{conv_id, message}`; streams `{type:tool_call,name,args}` per dispatched tool and `{type:reasoning_delta/answer_delta,content}` token-by-token as the model generates, then the authoritative `{type:reasoning,content}` / `{type:answer,content}` per step, then `{type:done}` (or `{type:error}`). Send `{conv_id, cancel:true}` to stop a running turn (⇒ `{type:canceled}` then `done`). Every event carries `conv_id`. |
 
 ## Frontend
 
@@ -246,7 +269,7 @@ components/
   FeedbackModal.jsx  — submit feedback (title + optional description)
   FeedbackPanel.jsx  — read-only display of the feedback queue with statuses
   MemoriesCard.jsx   — browse/add/edit/delete the agent's durable memories (GET public; mutations admin-gated via runProtected)
-  AgentPanel.jsx     — assistant drawer: collapsible right-edge panel (fixed; pushes/squishes the dashboard via right-padding on .app). Active-conversation tabs across the top, standard chat below. Sends over WS /api/ws/agent and renders live tool-dispatch chips as they stream (falls back to POST /api/send on WS failure). Past chats (persisted in `chat_sessions`) load on open and survive reloads — removed only via the per-tab × (DELETE /api/end). Desktop: drag the left edge to resize (width persisted in localStorage). Mobile: overlays instead of squishing.
+  AgentPanel.jsx     — assistant drawer: collapsible right-edge panel (fixed; pushes/squishes the dashboard via right-padding on .app). Active-conversation tabs across the top, standard chat below. Sends over WS /api/ws/agent and renders live tool-dispatch chips plus token-by-token streamed reasoning/answer text as they arrive (falls back to POST /api/send on WS failure). Past chats (persisted in `chat_sessions`) load on open and survive reloads — removed only via the per-tab × (DELETE /api/end). Desktop: drag the left edge to resize (width persisted in localStorage). Mobile: overlays instead of squishing.
 ```
 
 ### Polling intervals

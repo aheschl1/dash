@@ -16,11 +16,13 @@ from openai import OpenAI
 
 import db
 from .approval import ApprovalRequest
+from .cancel import CancelToken, TurnCanceled
 from .safe_commands import is_safe_command
 from .prompt import (
     LOCAL_API,
     build_conversation_notes_block,
     build_memory_block,
+    build_runtime_context,
     build_system_prompt,
 )
 
@@ -449,14 +451,16 @@ def web_search(query: str) -> str:
 
 
 def _with_memories(messages: list[dict], conv_id: str | None = None) -> list[dict]:
-    """Return a copy of `messages` with current memories — and, when `conv_id` is
-    given, this conversation's notes after them — appended to the system prompt's
-    content. Both are injected per-call and never persisted, so resumed chats and
-    chats created before a save still see the latest memories, and notes added
-    earlier in a conversation stay visible on later turns (the stored system
-    prompt deliberately holds neither — see prompt.build_memory_block /
+    """Return a copy of `messages` with the live runtime context (host facts +
+    OpenAPI endpoint list) and current memories — and, when `conv_id` is given,
+    this conversation's notes after them — appended to the system prompt's content.
+    All are injected per-call and never persisted, so resumed chats and chats
+    created before a deploy/save still see the current endpoint set and the latest
+    memories, and notes added earlier in a conversation stay visible on later turns
+    (the stored system prompt deliberately holds none of them — see
+    prompt.build_runtime_context / build_memory_block /
     build_conversation_notes_block)."""
-    block = build_memory_block()
+    block = build_runtime_context() + "\n\n" + build_memory_block()
     if conv_id:
         block += "\n\n" + build_conversation_notes_block(conv_id)
     out = list(messages)
@@ -467,7 +471,104 @@ def _with_memories(messages: list[dict], conv_id: str | None = None) -> list[dic
     return out
 
 
-def _run_loop(messages: list[dict], on_event=None, request_approval=None, conv_id=None) -> str:
+def _strip_reasoning(messages: list[dict]) -> list[dict]:
+    """Drop our persisted `reasoning` key before sending to the LLM.
+
+    We attach the model's `reasoning_content` to assistant turns so the UI can
+    show the thinking, but it's a display-only field — feeding it back as part of
+    an assistant message is non-standard and pointlessly inflates context, so each
+    message is shallow-copied without it on the way out."""
+    return [
+        {k: v for k, v in m.items() if k != "reasoning"} if "reasoning" in m else m
+        for m in messages
+    ]
+
+
+class _StreamedFunction:
+    def __init__(self, name: str, arguments: str):
+        self.name = name
+        self.arguments = arguments
+
+
+class _StreamedToolCall:
+    def __init__(self, id: str, name: str, arguments: str):
+        self.id = id
+        self.type = "function"
+        self.function = _StreamedFunction(name, arguments)
+
+
+class _StreamedMessage:
+    """Duck-types the non-streaming `resp.choices[0].message` the loop consumes
+    (`.content`, `.reasoning_content`, `.tool_calls`) so `_run_loop` is agnostic to
+    how the message was produced."""
+
+    def __init__(self, content: str, reasoning: str, tool_calls: list):
+        self.content = content
+        self.reasoning_content = reasoning
+        self.tool_calls = tool_calls or None
+
+
+def _stream_completion(messages: list[dict], cancel: "CancelToken | None", on_delta=None) -> "_StreamedMessage | None":
+    """Run one chat completion in streaming mode, reassembling the deltas into a
+    single message. Returns None if `cancel` is tripped mid-stream — we close the
+    stream (aborting the HTTP request, so llama.cpp stops generating) and discard
+    the partial output, leaving nothing appended to the caller's message list.
+
+    We stream so a long generation can be interrupted, AND — when `on_delta` is
+    given — so each content/reasoning fragment can be forwarded live to the UI as
+    `answer_delta`/`reasoning_delta` events; the reassembled message is still handed
+    back whole, exactly as the blocking call used to return it (the loop and the
+    persisted history are unchanged — the deltas are display-only)."""
+    stream = client.chat.completions.create(
+        model=MODEL,
+        messages=messages,
+        tools=TOOLS,
+        stream=True,
+    )
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    # tool_calls arrive across deltas keyed by index; id/name land once, arguments
+    # accumulate as a JSON string fragment by fragment.
+    tool_calls: dict[int, dict] = {}
+    try:
+        for chunk in stream:
+            if cancel is not None and cancel.is_set():
+                return None
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if delta is None:
+                continue
+            rc = getattr(delta, "reasoning_content", None)
+            if rc:
+                reasoning_parts.append(rc)
+                if on_delta:
+                    on_delta({"type": "reasoning_delta", "content": rc})
+            if delta.content:
+                content_parts.append(delta.content)
+                if on_delta:
+                    on_delta({"type": "answer_delta", "content": delta.content})
+            for tcd in (delta.tool_calls or []):
+                slot = tool_calls.setdefault(tcd.index, {"id": "", "name": "", "arguments": ""})
+                if tcd.id:
+                    slot["id"] = tcd.id
+                fn = getattr(tcd, "function", None)
+                if fn is not None:
+                    if fn.name:
+                        slot["name"] = fn.name
+                    if fn.arguments:
+                        slot["arguments"] += fn.arguments
+    finally:
+        stream.close()
+
+    assembled = [
+        _StreamedToolCall(tc["id"], tc["name"], tc["arguments"])
+        for _, tc in sorted(tool_calls.items())
+    ]
+    return _StreamedMessage("".join(content_parts), "".join(reasoning_parts).strip(), assembled)
+
+
+def _run_loop(messages: list[dict], on_event=None, request_approval=None, conv_id=None, cancel=None) -> str:
     """Drive `messages` through tool calls to a final answer.
 
     Appends assistant and tool messages in place so callers that retain the
@@ -488,12 +589,27 @@ def _run_loop(messages: list[dict], on_event=None, request_approval=None, conv_i
     empty_retries = 0
 
     for _ in range(MAX_STEPS):
-        resp = client.chat.completions.create(
-            model=MODEL,
-            messages=_with_memories(messages, conv_id) + nudges,
-            tools=TOOLS,
+        # Stop before starting the next step. The message list ends on a clean
+        # boundary here (user turn or a complete set of tool results), so unwinding
+        # now leaves it valid for the next turn — see TurnCanceled.
+        if cancel is not None and cancel.is_set():
+            raise TurnCanceled()
+        msg = _stream_completion(
+            _strip_reasoning(_with_memories(messages, conv_id) + nudges), cancel, on_event
         )
-        msg = resp.choices[0].message
+        # Cancelled mid-generation: the stream was aborted and nothing appended.
+        if msg is None:
+            raise TurnCanceled()
+
+        # Reasoning models (Qwen3.5, Gemma-4) route their chain-of-thought into a
+        # separate `reasoning_content` field (llama.cpp --jinja --reasoning). Stream
+        # it live so the panel can show the thinking, and attach it to the persisted
+        # assistant turn below so a reloaded chat shows it too. It is stripped back
+        # out before the next LLM call (see _strip_reasoning) so it never re-enters
+        # the model's context.
+        reasoning = (getattr(msg, "reasoning_content", None) or "").strip()
+        if reasoning and on_event:
+            on_event({"type": "reasoning", "content": reasoning})
 
         if not msg.tool_calls:
             answer = (msg.content or "").strip()
@@ -505,7 +621,10 @@ def _run_loop(messages: list[dict], on_event=None, request_approval=None, conv_i
                     nudges = [{"role": "user", "content": EMPTY_NUDGE}]
                 empty_retries += 1
                 continue
-            messages.append({"role": "assistant", "content": answer})
+            final = {"role": "assistant", "content": answer}
+            if reasoning:
+                final["reasoning"] = reasoning
+            messages.append(final)
             return answer
 
         # A real tool call arrived: drop any pending nudge so it can't sit in
@@ -516,6 +635,7 @@ def _run_loop(messages: list[dict], on_event=None, request_approval=None, conv_i
             {
                 "role": "assistant",
                 "content": msg.content or "",
+                **({"reasoning": reasoning} if reasoning else {}),
                 "tool_calls": [
                     {
                         "id": tc.id,
@@ -599,7 +719,7 @@ def new_messages() -> list[dict]:
     return [{"role": "system", "content": build_system_prompt()}]
 
 
-def continue_conversation(messages: list[dict], query: str, on_event=None, request_approval=None, conv_id=None) -> str:
+def continue_conversation(messages: list[dict], query: str, on_event=None, request_approval=None, conv_id=None, cancel=None) -> str:
     """Append a user turn to an existing conversation and run to an answer."""
     messages.append({"role": "user", "content": query})
-    return _run_loop(messages, on_event, request_approval, conv_id)
+    return _run_loop(messages, on_event, request_approval, conv_id, cancel)

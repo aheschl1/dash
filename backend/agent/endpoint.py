@@ -25,6 +25,7 @@ import db
 
 from . import store
 from .approval import ApprovalGate
+from .cancel import CancelToken, TurnCanceled
 from .main import continue_conversation
 
 router = APIRouter()
@@ -67,6 +68,9 @@ def _render(messages: list[dict]) -> list[dict]:
         if role == "user":
             turns.append({"role": "user", "content": m.get("content", "")})
         elif role == "assistant":
+            reasoning = (m.get("reasoning") or "").strip()
+            if reasoning:
+                turns.append({"role": "reasoning", "content": reasoning})
             for tc in m.get("tool_calls") or []:
                 turns.append({"role": "tool", "content": _tool_chip(tc)})
             if content:
@@ -142,6 +146,14 @@ class _Turn:
         self.gate = ApprovalGate(
             asyncio.get_running_loop(), self.dispatch, conv_id, APPROVAL_TIMEOUT
         )
+        # Tripped from the loop thread (a {cancel} WS frame) to stop the turn at
+        # the next step / mid-stream. Also denies any pending approval so a turn
+        # parked on a prompt unwinds instead of hanging until the timeout.
+        self.cancel_token = CancelToken()
+
+    def cancel(self) -> None:
+        self.cancel_token.cancel()
+        self.gate.cancel_all()
 
     def attach(self, q: "asyncio.Queue") -> list[dict]:
         """Subscribe a queue and atomically snapshot what already happened.
@@ -156,7 +168,12 @@ class _Turn:
         self.subscribers.discard(q)
 
     def dispatch(self, ev: dict) -> None:
-        if ev.get("type") == "tool_call":
+        # Buffer only the discrete, replayable events for resume. The live token
+        # deltas (answer_delta/reasoning_delta) are display-only and deliberately
+        # NOT buffered: a reconnect mid-generation skips the partial text and the
+        # `done` reload restores the canonical turn (the full `reasoning` event for
+        # the step, and the final `answer`, are what get replayed/persisted).
+        if ev.get("type") in ("tool_call", "reasoning"):
             self.events.append(ev)
         for q in self.subscribers:
             q.put_nowait(ev)
@@ -177,10 +194,16 @@ async def _run_turn(turn: "_Turn", messages: list[dict]) -> None:
 
     try:
         answer = await loop.run_in_executor(
-            None, continue_conversation, messages, turn.user_message, on_event, turn.gate.request, conv_id
+            None, continue_conversation, messages, turn.user_message, on_event,
+            turn.gate.request, conv_id, turn.cancel_token,
         )
         await loop.run_in_executor(None, store.save, conv_id, messages)
         turn.dispatch({"type": "answer", "conv_id": conv_id, "content": answer})
+    except TurnCanceled:
+        # Cancelled at a clean boundary: persist the partial turn (it's valid — any
+        # completed tool calls have their results) and tell the UI it stopped.
+        await loop.run_in_executor(None, store.save, conv_id, messages)
+        turn.dispatch({"type": "canceled", "conv_id": conv_id})
     except Exception as e:
         turn.dispatch({"type": "error", "conv_id": conv_id, "error": str(e)})
     finally:
@@ -205,9 +228,11 @@ async def ws_agent(ws: WebSocket):
                                 answer a root_bash approval prompt (approve needs a
                                 valid admin token; deny needs none)
 
-    Server → client events all carry conv_id: tool_call, approval_request, answer,
-    error, done, plus resume (subscribe to a live turn), idle (nothing running), and
-    approval_unauthorized (approve without a valid admin token).
+    Server → client events all carry conv_id: tool_call, reasoning_delta/answer_delta
+    (live token streams reassembled by the UI into one bubble), reasoning/answer (the
+    authoritative full text for the step, which finalizes the streamed bubble),
+    approval_request, error, done, plus resume (subscribe to a live turn), idle
+    (nothing running), and approval_unauthorized (approve without a valid admin token).
 
     Every outbound frame goes through the single writer draining `out`; Starlette
     sockets can't be written from two coroutines at once. The turn itself runs in
@@ -260,7 +285,18 @@ async def ws_agent(ws: WebSocket):
             conv_id = (data or {}).get("conv_id")
             approval_id = (data or {}).get("approval_id")
             subscribe_req = bool((data or {}).get("subscribe"))
+            cancel_req = bool((data or {}).get("cancel"))
             message = ((data or {}).get("message") or "").strip()
+
+            # Stop a running turn: trip its cancel token (and deny any pending
+            # approval) so the agent loop unwinds at its next safe point. Needs no
+            # auth — like denying an approval, cancelling is the fail-safe direction.
+            # Any subscribed socket may cancel; the turn still persists + emits done.
+            if cancel_req:
+                turn = _running.get(conv_id)
+                if turn is not None:
+                    turn.cancel()
+                continue
 
             # A reply to a root_bash approval prompt: resolve the pending approval
             # on its turn, which unblocks the agent's executor thread. Approving runs

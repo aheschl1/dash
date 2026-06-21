@@ -1061,6 +1061,42 @@ body.agent-resizing .agent-resize::after { background: var(--accent); }
   word-break: break-all;
 }
 
+.agent-reasoning {
+  align-self: stretch;
+  max-width: 100%;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 4px 10px;
+}
+
+.agent-reasoning > summary {
+  cursor: pointer;
+  user-select: none;
+  font-style: italic;
+  color: var(--text-muted);
+}
+
+.agent-reasoning > summary::marker {
+  color: var(--accent);
+}
+
+.agent-reasoning-body {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-muted);
+  max-height: 320px;
+  overflow-y: auto;
+}
+
 .agent-approval {
   align-self: stretch;
   border: 1px solid var(--orange);
@@ -1162,6 +1198,15 @@ body.agent-resizing .agent-resize::after { background: var(--accent); }
   cursor: pointer;
 }
 .agent-input button:disabled { opacity: 0.5; cursor: default; }
+.agent-input button.agent-stop { background: var(--red); color: var(--text); }
+
+/* Inline muted status line in the transcript (e.g. a stopped turn). */
+.agent-note {
+  align-self: center;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-style: italic;
+}
 
 /* Floating prompt anchored to a text selection anywhere on the dashboard. */
 .ask-selection-btn {
@@ -1206,3 +1251,66 @@ body.agent-resizing .agent-resize::after { background: var(--accent); }
   .agent-panel { width: 100%; max-width: none; }
   .agent-resize { display: none; }
 }
+
+/* Scheduled jobs + reflection log card */
+.card-subtitle {
+  margin-top: 14px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.jobs-list { display: flex; flex-direction: column; gap: 4px; }
+.job-row {
+  display: grid;
+  grid-template-columns: 90px 1fr auto;
+  gap: 10px;
+  align-items: baseline;
+  padding: 6px 8px;
+  background: var(--surface2);
+  border-radius: 6px;
+  font-size: 13px;
+}
+.job-id { font-weight: 600; color: var(--text); }
+.job-trigger { color: var(--text-muted); font-size: 12px; font-family: ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.job-next { color: var(--accent); font-size: 12px; white-space: nowrap; }
+
+.reflect-log { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.reflect-run { background: var(--surface2); border-radius: 6px; }
+.reflect-run-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+}
+.reflect-run-head.clickable { cursor: pointer; }
+.reflect-run-head.clickable:hover { background: var(--border); border-radius: 6px; }
+.reflect-run-time { font-size: 13px; color: var(--text); }
+.reflect-run-stats { display: flex; align-items: center; gap: 6px; }
+.reflect-chip {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 10px;
+  background: var(--border);
+  color: var(--text-muted);
+}
+.reflect-chip.reflect-add { background: rgba(63, 185, 80, 0.15); color: var(--green); }
+.reflect-chip.reflect-del { background: rgba(248, 81, 73, 0.15); color: var(--red); }
+.reflect-chip.reflect-err { background: rgba(210, 153, 34, 0.18); color: var(--yellow); }
+.reflect-run-dur { font-size: 11px; color: var(--text-muted); }
+.reflect-caret { font-size: 11px; color: var(--text-muted); width: 10px; }
+
+.reflect-run-body {
+  padding: 4px 10px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  border-top: 1px solid var(--border);
+}
+.reflect-line { font-size: 12px; line-height: 1.4; }
+.reflect-line.reflect-add { color: var(--green); }
+.reflect-line.reflect-del { color: var(--red); }
+.reflect-line.reflect-err { color: var(--yellow); font-family: ui-monospace, monospace; }

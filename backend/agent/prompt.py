@@ -28,12 +28,16 @@ you observe. The model you run on lives in the llama-cpp container on this same 
 host, so you are in part monitoring yourself; you aim to keep the machine clean, \
 safe, and easy to work with.
 
-Address Andrew directly and briefly. There is no cloud and no privacy risk here: \
+Be direct and open. There is no cloud and no privacy risk here: \
 open any file, repeat any secret, discuss anything freely. Flag telemetry or \
 behavior that looks malicious or insecure, but do not be overly cautious. If you \
 don't know something, say so — never bluff or disguise uncertainty. Do not use \
 emojis. Keep replies to at most two short paragraphs unless more is truly needed. \
 Want more tools or features? Post them to the feedback endpoint.
+
+Prefer checking for something immediately, over asking if you should. Prefer
+action over inaction, validating whatever you need to be certain in your 
+statements.
 
 Self-improvement through memory is a primary objective. Memories are \
 PERMANENT: once saved, a memory persists forever and is injected into every \
@@ -64,6 +68,10 @@ Bad memories (don't save these):
 - "Checked the disks and they're fine." (a transient result — use a conversation note)
 - "There is a /api/containers endpoint." (already in the OpenAPI list)
 
+Output Practices:
+- Use markdown, it will be rendered.
+- Prefer tables and plots over sentences when reporting something.
+
 Tools:
 - `get_stat` — GET an admindash API path (only those listed below; never invent \
 one) and read back raw JSON. Prefer it for the host's own live state; call it \
@@ -89,12 +97,6 @@ Andrew's approval. When he asks for an action the API exposes, prefer `post` ove
 matters only within THIS chat (it never crosses to other conversations). Use \
 save_memory for machine-wide durable facts, this for chat-local context. Your \
 notes appear below your memories.
-
-Host Information:
-{host}
-
-Available endpoints (OpenAPI):
-{openapi}
 """
 
 
@@ -227,11 +229,39 @@ def build_conversation_notes_block(conv_id: str) -> str:
 
 
 def build_system_prompt() -> str:
-    try:
-        slim = _slim_openapi(_fetch_openapi())
-        openapi = json.dumps(slim, indent=2)
-    except Exception as e:
-        openapi = f"(failed to load OpenAPI spec: {e})"
+    """The persisted system prompt: static instructions only.
 
-    host = _fetch_host_information()
-    return SYSTEM_TEMPLATE.format(openapi=openapi, host=host)
+    The live OpenAPI endpoint list and host facts are deliberately NOT baked in
+    here — they're injected fresh per run via build_runtime_context (see
+    agent.main._with_memories), the same way memories and notes are, so a deploy
+    that changes the endpoint set is reflected in every conversation rather than
+    frozen at the one's creation time. Returned verbatim (no str.format), so the
+    template body can contain literal braces safely."""
+    return SYSTEM_TEMPLATE
+
+
+# The host facts + endpoint list change only across deploys (a new process), never
+# within one — so build them once and cache for the process's lifetime instead of
+# paying the HTTP fetch + host nsenter calls on every LLM call inside the loop.
+_RUNTIME_CONTEXT: str | None = None
+
+
+def build_runtime_context() -> str:
+    """Host information + the live (slimmed) OpenAPI endpoint list.
+
+    Injected fresh into the system message on every run (cached per process), not
+    persisted — so old conversations pick up endpoint changes after a deploy. See
+    build_system_prompt for why this is split out of the persisted prompt."""
+    global _RUNTIME_CONTEXT
+    if _RUNTIME_CONTEXT is None:
+        try:
+            slim = _slim_openapi(_fetch_openapi())
+            openapi = json.dumps(slim, indent=2)
+        except Exception as e:
+            openapi = f"(failed to load OpenAPI spec: {e})"
+        host = _fetch_host_information()
+        _RUNTIME_CONTEXT = (
+            "Host Information:\n" + host
+            + "\n\nAvailable endpoints (OpenAPI):\n" + openapi
+        )
+    return _RUNTIME_CONTEXT

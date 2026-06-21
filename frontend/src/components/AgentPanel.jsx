@@ -14,6 +14,28 @@ const toolChipText = (ev) => {
   return `${ev.name}${arg ? ' ' + arg : ''}`
 }
 
+// Append a streamed token to the trailing live bubble of `role`, or start one.
+// Live bubbles carry `streaming: true` until the server sends the authoritative
+// full event for the step (see finalizeStream).
+const appendDelta = (m, role, chunk) => {
+  const last = m[m.length - 1]
+  if (last && last.role === role && last.streaming) {
+    return [...m.slice(0, -1), { ...last, content: last.content + chunk }]
+  }
+  return [...m, { role, content: chunk, streaming: true }]
+}
+
+// Replace the in-flight streamed bubble of `role` with the authoritative content
+// the server sends once the step completes (or append if nothing streamed).
+const finalizeStream = (m, role, content) => {
+  let found = false
+  const next = m.map(x => {
+    if (x.role === role && x.streaming) { found = true; return { role, content } }
+    return x
+  })
+  return found ? next : [...next, { role, content }]
+}
+
 // Open links in a new tab; everything else renders with library defaults.
 const MD_COMPONENTS = {
   a: ({ node, ...props }) => <a {...props} target="_blank" rel="noopener noreferrer" />,
@@ -177,11 +199,24 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
   const handleEvent = useCallback(async (ev) => {
     if (ev.conv_id && ev.conv_id !== activeIdRef.current) return
     if (ev.type === 'tool_call') {
-      setMessages(m => [...m, { role: 'tool', content: toolChipText(ev) }])
+      // A tool call ended the step: drop any streamed preamble (the persisted
+      // render never shows assistant content that accompanies tool calls), then
+      // add the chip.
+      setMessages(m => [...m.filter(x => !(x.role === 'assistant' && x.streaming)), { role: 'tool', content: toolChipText(ev) }])
+    } else if (ev.type === 'answer_delta') {
+      setMessages(m => appendDelta(m, 'assistant', ev.content))
+    } else if (ev.type === 'reasoning_delta') {
+      setMessages(m => appendDelta(m, 'reasoning', ev.content))
+    } else if (ev.type === 'reasoning') {
+      setMessages(m => finalizeStream(m, 'reasoning', ev.content))
     } else if (ev.type === 'answer') {
-      setMessages(m => [...m, { role: 'assistant', content: ev.content }])
+      setMessages(m => finalizeStream(m, 'assistant', ev.content))
     } else if (ev.type === 'error') {
-      setMessages(m => [...m, { role: 'assistant', content: `Error: ${ev.error}` }])
+      setMessages(m => [...m.filter(x => !x.streaming), { role: 'assistant', content: `Error: ${ev.error}` }])
+    } else if (ev.type === 'canceled') {
+      // Partial streamed text wasn't persisted; drop it so the bubble matches the
+      // canonical (cancelled) turn.
+      setMessages(m => [...m.filter(x => !x.streaming), { role: 'note', content: 'Stopped.' }])
     } else if (ev.type === 'approval_request') {
       setMessages(m => [...m, { role: 'approval', approval_id: ev.approval_id, kind: ev.kind, summary: ev.summary, detail: ev.detail, status: 'pending' }])
     } else if (ev.type === 'approval_unauthorized') {
@@ -203,7 +238,10 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
       const prior = await fetchRendered(ev.conv_id)
       if (ev.conv_id !== activeIdRef.current) return
       const base = Array.isArray(prior) ? prior : []
-      const chips = (ev.events || []).map(e => ({ role: 'tool', content: toolChipText(e) }))
+      const chips = (ev.events || []).map(e =>
+        e.type === 'reasoning'
+          ? { role: 'reasoning', content: e.content }
+          : { role: 'tool', content: toolChipText(e) })
       const approvals = (ev.approvals || []).map(a => ({ role: 'approval', approval_id: a.approval_id, kind: a.kind, summary: a.summary, detail: a.detail, status: 'pending' }))
       setMessages([...base, { role: 'user', content: ev.user_message }, ...chips, ...approvals])
     } else if (ev.type === 'idle') {
@@ -327,6 +365,17 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
     }
   }, [input, context, activeId, sending, sendViaPost])
 
+  // Stop the in-flight turn: ask the server to cancel it over the WS. The agent
+  // loop unwinds at its next safe point and the server emits canceled + done, which
+  // clears the spinner; no optimistic state change here. Needs no auth.
+  const stop = useCallback(() => {
+    const ws = wsRef.current
+    const id = activeIdRef.current
+    if (ws && ws.readyState === WebSocket.OPEN && id) {
+      ws.send(JSON.stringify({ conv_id: id, cancel: true }))
+    }
+  }, [])
+
   // Answer a gated-tool approval prompt (root_bash / post) over the WS and mark the
   // bubble resolved. Approving runs a privileged action, so it's gated behind admin
   // login (runProtected prompts for it and replays on success) and carries the Bearer
@@ -401,6 +450,13 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
         )}
         {messages.map((m, i) => {
           if (m.role === 'tool') return <div key={i} className="agent-tool">→ {m.content}</div>
+          if (m.role === 'note') return <div key={i} className="agent-note">{m.content}</div>
+          if (m.role === 'reasoning') return (
+            <details key={i} className="agent-reasoning" open={!!m.streaming}>
+              <summary>Thinking</summary>
+              <div className="agent-reasoning-body">{m.content}</div>
+            </details>
+          )
           if (m.role === 'approval') return (
             <div key={i} className={`agent-approval agent-approval-${m.status}`}>
               <div className="agent-approval-head">{m.kind === 'post' ? 'Send this request?' : 'Run this command as root?'}</div>
@@ -420,7 +476,9 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
           )
           return <div key={i} className={`agent-msg agent-msg-${m.role}`}>{m.content}</div>
         })}
-        {sending && <div className="agent-msg agent-msg-assistant agent-typing">…</div>}
+        {sending && !(messages.length && messages[messages.length - 1].streaming) && (
+          <div className="agent-msg agent-msg-assistant agent-typing">…</div>
+        )}
       </div>
 
       {context && (
@@ -445,7 +503,9 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
           placeholder={context ? 'Ask about the highlighted text…' : 'Ask the assistant…'}
           rows={2}
         />
-        <button type="submit" disabled={sending || (!input.trim() && !context)}>Send</button>
+        {sending
+          ? <button type="button" className="agent-stop" onClick={stop} title="Stop the assistant">Stop</button>
+          : <button type="submit" disabled={!input.trim() && !context}>Send</button>}
       </form>
     </aside>
   )

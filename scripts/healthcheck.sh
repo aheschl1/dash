@@ -52,6 +52,14 @@ else
     ok
 fi
 
+step 5b "API /api/containers/admindash/stats"
+if ! curl -skf --max-time 10 "$DASH_URL/api/containers/admindash/stats" \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'cpu_pct' in d and 'usage_bytes' in d.get('memory',{}) and 'rx_bytes_total' in d.get('network',{}) and 'read_bytes_total' in d.get('block_io',{}), 'missing stat fields'" 2>/dev/null; then
+    fail "/api/containers/{name}/stats missing or invalid"
+else
+    ok
+fi
+
 step 6 "API /api/feedback"
 if ! curl -skf --max-time 10 "$DASH_URL/api/feedback" \
     | python3 -c "import sys,json; d=json.load(sys.stdin); assert isinstance(d,list)" 2>/dev/null; then

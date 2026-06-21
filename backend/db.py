@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     updated_at BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_chat_sessions_updated ON chat_sessions(updated_at);
+ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS reflected_at BIGINT;
 CREATE TABLE IF NOT EXISTS agent_memories (
     id         SERIAL PRIMARY KEY,
     content    TEXT NOT NULL,
@@ -76,6 +77,15 @@ CREATE TABLE IF NOT EXISTS conversation_notes (
     created_at BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_conversation_notes_conv ON conversation_notes(conv_id);
+CREATE TABLE IF NOT EXISTS reflection_runs (
+    id            SERIAL PRIMARY KEY,
+    started_at    BIGINT NOT NULL,
+    finished_at   BIGINT NOT NULL,
+    conversations INTEGER NOT NULL DEFAULT 0,
+    added         JSONB NOT NULL DEFAULT '[]',
+    deleted       JSONB NOT NULL DEFAULT '[]',
+    errors        JSONB NOT NULL DEFAULT '[]'
+);
 DROP TABLE IF EXISTS feedback_runs;
 """
 
@@ -292,6 +302,31 @@ def chat_list(limit: int = 100) -> list[dict]:
     return [{"id": r[0], "title": r[1], "turns": r[2]} for r in rows]
 
 
+def chat_unreflected(limit: int) -> list[str]:
+    """Ids of conversations the nightly reflection still owes a pass: never
+    reflected, or changed (a new turn bumped updated_at) since the last pass.
+    Newest first, so a capped run reflects the freshest chats and leaves the
+    rest for the next night."""
+    with psycopg.connect(DSN) as con:
+        rows = con.execute(
+            "SELECT id FROM chat_sessions "
+            "WHERE reflected_at IS NULL OR reflected_at < updated_at "
+            "ORDER BY updated_at DESC LIMIT %s",
+            (limit,),
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+def chat_mark_reflected(id: str) -> None:
+    """Stamp a conversation as reflected now. Reflection never calls chat_save, so
+    updated_at stays put and this row won't resurface until a real new turn moves
+    updated_at past this stamp again."""
+    now = int(datetime.now(timezone.utc).timestamp())
+    with psycopg.connect(DSN) as con:
+        con.execute("UPDATE chat_sessions SET reflected_at=%s WHERE id=%s", (now, id))
+        con.commit()
+
+
 def chat_delete(id: str) -> bool:
     with psycopg.connect(DSN) as con:
         n = con.execute("DELETE FROM chat_sessions WHERE id=%s", (id,)).rowcount
@@ -339,6 +374,48 @@ def memory_list() -> list[dict]:
             "SELECT id, content, created_at FROM agent_memories ORDER BY id"
         ).fetchall()
     return [{"id": r[0], "content": r[1], "created_at": r[2]} for r in rows]
+
+
+# ── Reflection runs ───────────────────────────────────────────────────────────
+# An audit log of the nightly self-reflection job (see agent/reflect.py): what it
+# added, what it pruned, how many conversations it mined, and any errors. Kept so
+# the dashboard can show what the agent did to its own memory while unattended.
+
+REFLECTION_RUNS_MAX = int(os.environ.get("AGENT_REFLECTION_RUNS_MAX", "50"))
+
+
+def reflection_run_save(started_at: int, finished_at: int, conversations: int,
+                        added: list, deleted: list, errors: list) -> int:
+    """Record one reflection run, then prune to the most recent REFLECTION_RUNS_MAX."""
+    with psycopg.connect(DSN) as con:
+        row = con.execute(
+            "INSERT INTO reflection_runs "
+            "(started_at, finished_at, conversations, added, deleted, errors) "
+            "VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
+            (started_at, finished_at, conversations,
+             Jsonb(added), Jsonb(deleted), Jsonb(errors)),
+        ).fetchone()
+        con.execute(
+            "DELETE FROM reflection_runs WHERE id NOT IN "
+            "(SELECT id FROM reflection_runs ORDER BY id DESC LIMIT %s)",
+            (REFLECTION_RUNS_MAX,),
+        )
+        con.commit()
+    return row[0]
+
+
+def reflection_run_list(limit: int = 20) -> list[dict]:
+    with psycopg.connect(DSN) as con:
+        rows = con.execute(
+            "SELECT id, started_at, finished_at, conversations, added, deleted, errors "
+            "FROM reflection_runs ORDER BY id DESC LIMIT %s",
+            (limit,),
+        ).fetchall()
+    return [
+        {"id": r[0], "started_at": r[1], "finished_at": r[2], "conversations": r[3],
+         "added": r[4], "deleted": r[5], "errors": r[6]}
+        for r in rows
+    ]
 
 
 # ── Conversation notes ──────────────────────────────────────────────────────────
