@@ -41,11 +41,45 @@ const MD_COMPONENTS = {
   a: ({ node, ...props }) => <a {...props} target="_blank" rel="noopener noreferrer" />,
 }
 
+// Like MD_COMPONENTS but overlays a pin on fenced code blocks (`pre`, never inline
+// `code`) and tables. The pinned source is recovered by slicing the original
+// message text via the node's remark position offsets — exact verbatim markdown,
+// more faithful than rebuilding a table from the AST. Used only on answer bubbles.
+const makeMdComponents = (rawContent, onPin) => {
+  const pinButton = (kind) => (node) => {
+    const p = node?.position
+    if (!p || !onPin) return null
+    return (
+      <button
+        type="button"
+        className="pin-btn"
+        title="Pin to investigation board"
+        onClick={() => onPin({ kind, content: rawContent.slice(p.start.offset, p.end.offset) })}
+      >📌</button>
+    )
+  }
+  return {
+    ...MD_COMPONENTS,
+    pre: ({ node, children, ...props }) => (
+      <div className="pinnable">
+        {pinButton('code')(node)}
+        <pre {...props}>{children}</pre>
+      </div>
+    ),
+    table: ({ node, children, ...props }) => (
+      <div className="pinnable">
+        {pinButton('table')(node)}
+        <table {...props}>{children}</table>
+      </div>
+    ),
+  }
+}
+
 // Right-edge assistant drawer. Collapsed it's a thin rail; expanded it pushes the
 // dashboard left (via padding on .app). The top row lists past conversations
 // (persisted in Postgres); each is a standard chat. Chats survive reloads and
 // restarts — they're removed only by the explicit delete (×) button.
-export default function AgentPanel({ open, setOpen, runProtected, pendingContext, clearPendingContext }) {
+export default function AgentPanel({ open, setOpen, runProtected, pendingContext, clearPendingContext, onPinned }) {
   const [conversations, setConversations] = useState([])
   const [activeId, setActiveId] = useState(null)
   const [messages, setMessages] = useState([])
@@ -82,6 +116,21 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
     } catch {}
     return []
   }, [])
+
+  // Pin a code/table block from an answer onto the investigation board, tagged
+  // with the conversation it came from, then open the board (via App).
+  const pinBlock = useCallback(async ({ kind, content }) => {
+    const id = activeIdRef.current
+    const title = conversations.find(c => c.id === id)?.title || ''
+    try {
+      await fetch('/api/board', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind, content, source_conv: id, source_title: title }),
+      })
+      onPinned?.()
+    } catch {}
+  }, [conversations, onPinned])
 
   // Fetch a conversation's rendered turns without touching state. Returns the
   // array, null on 404 (gone), or undefined on a transient error.
@@ -471,7 +520,7 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
           )
           if (m.role === 'assistant') return (
             <div key={i} className="agent-msg agent-msg-assistant agent-md">
-              <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>{m.content}</ReactMarkdown>
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={makeMdComponents(m.content, pinBlock)}>{m.content}</ReactMarkdown>
             </div>
           )
           return <div key={i} className={`agent-msg agent-msg-${m.role}`}>{m.content}</div>

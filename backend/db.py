@@ -70,6 +70,17 @@ CREATE TABLE IF NOT EXISTS agent_memories (
     content    TEXT NOT NULL,
     created_at BIGINT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS board_cards (
+    id           SERIAL PRIMARY KEY,
+    kind         TEXT NOT NULL,
+    content      TEXT NOT NULL,
+    col          TEXT NOT NULL DEFAULT 'todo',
+    pos          DOUBLE PRECISION NOT NULL DEFAULT 0,
+    source_conv  TEXT,
+    source_title TEXT,
+    created_at   BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_board_cards_col ON board_cards(col, pos);
 CREATE TABLE IF NOT EXISTS conversation_notes (
     id         SERIAL PRIMARY KEY,
     conv_id    TEXT NOT NULL,
@@ -374,6 +385,62 @@ def memory_list() -> list[dict]:
             "SELECT id, content, created_at FROM agent_memories ORDER BY id"
         ).fetchall()
     return [{"id": r[0], "content": r[1], "created_at": r[2]} for r in rows]
+
+
+# ── Investigation board ───────────────────────────────────────────────────────
+
+_BOARD_COLS = "id, kind, content, col, pos, source_conv, source_title, created_at"
+
+
+def _board_row(r) -> dict:
+    return {
+        "id": r[0], "kind": r[1], "content": r[2], "col": r[3], "pos": r[4],
+        "source_conv": r[5], "source_title": r[6], "created_at": r[7],
+    }
+
+
+def board_add(
+    kind: str, content: str, source_conv: str | None, source_title: str | None,
+    col: str = "todo",
+) -> dict:
+    """Pin a code/table block onto the board, appended to the bottom of `col`."""
+    now = int(datetime.now(timezone.utc).timestamp())
+    with psycopg.connect(DSN) as con:
+        nxt = con.execute(
+            "SELECT COALESCE(MAX(pos), 0) + 1 FROM board_cards WHERE col=%s", (col,)
+        ).fetchone()[0]
+        row = con.execute(
+            f"INSERT INTO board_cards (kind, content, col, pos, source_conv, source_title, created_at) "
+            f"VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING {_BOARD_COLS}",
+            (kind, content, col, nxt, source_conv, source_title, now),
+        ).fetchone()
+        con.commit()
+    return _board_row(row)
+
+
+def board_move(id: int, col: str, pos: float) -> bool:
+    """Reassign a card's column and fractional position. False if no such id."""
+    with psycopg.connect(DSN) as con:
+        n = con.execute(
+            "UPDATE board_cards SET col=%s, pos=%s WHERE id=%s", (col, pos, id)
+        ).rowcount
+        con.commit()
+    return n > 0
+
+
+def board_delete(id: int) -> bool:
+    with psycopg.connect(DSN) as con:
+        n = con.execute("DELETE FROM board_cards WHERE id=%s", (id,)).rowcount
+        con.commit()
+    return n > 0
+
+
+def board_list() -> list[dict]:
+    with psycopg.connect(DSN) as con:
+        rows = con.execute(
+            f"SELECT {_BOARD_COLS} FROM board_cards ORDER BY col, pos"
+        ).fetchall()
+    return [_board_row(r) for r in rows]
 
 
 # ── Reflection runs ───────────────────────────────────────────────────────────

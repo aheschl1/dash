@@ -11,6 +11,7 @@ from db import (init_db, insert_snapshot, query_history, insert_event, query_eve
                insert_feedback, list_feedback, update_feedback_status,
                get_auth_secret, get_user, set_password,
                memory_list, memory_save, memory_update, memory_delete,
+               board_list, board_add, board_move, board_delete,
                reflection_run_list)
 from collectors import system, gpu, temps, containers, ports, wireguard, disk, processes, network, connections
 from collectors import events as events_collector, smart, alerts, sessions, hardware, vms, cron, directory, vpn
@@ -386,6 +387,47 @@ def edit_memory(
 def remove_memory(id: int, user: dict = Depends(require_admin)):
     if not memory_delete(id):
         return JSONResponse(status_code=404, content={"error": "unknown memory"})
+    return {"deleted": id}
+
+
+# ── Investigation board ───────────────────────────────────────────────────────
+# Public, like chat sends — pinning is part of the agent workflow, not server config.
+
+
+@app.get("/api/board")
+def get_board():
+    return {"cards": board_list()}
+
+
+@app.post("/api/board")
+def add_board_card(
+    kind: str = Body(...),
+    content: str = Body(...),
+    source_conv: str | None = Body(None),
+    source_title: str | None = Body(None),
+):
+    content = content.strip()
+    if kind not in ("code", "table") or not content:
+        return JSONResponse(status_code=400, content={"error": "kind and content required"})
+    card = board_add(kind, content, source_conv, source_title)
+    return {"card": card}
+
+
+@app.patch("/api/board/{id}")
+def move_board_card(
+    id: int,
+    col: str = Body(..., embed=True),
+    pos: float = Body(..., embed=True),
+):
+    if not board_move(id, col, pos):
+        return JSONResponse(status_code=404, content={"error": "unknown card"})
+    return {"id": id, "col": col, "pos": pos}
+
+
+@app.delete("/api/board/{id}")
+def remove_board_card(id: int):
+    if not board_delete(id):
+        return JSONResponse(status_code=404, content={"error": "unknown card"})
     return {"deleted": id}
 
 

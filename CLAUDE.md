@@ -186,6 +186,7 @@ feedback      — id, type (vestigial, always 'feedback'), title, description, s
 users         — id, username (unique), password_hash, salt, role, created_at (admin accounts)
 auth_config   — key/value; holds the persisted token-signing secret ('token_secret')
 chat_sessions — id (uuid), title, turns, messages (JSONB raw message list), created_at, updated_at (persisted agent chats; most-recent-N retained)
+board_cards   — id, kind ('code'|'table'), content (raw markdown block), col ('todo'|'looking'|'done'), pos (fractional sort key), source_conv, source_title, created_at (investigation-board pins; one global board)
 ```
 
 ### API endpoints
@@ -227,6 +228,10 @@ chat_sessions — id (uuid), title, turns, messages (JSONB raw message list), cr
 | POST | `/api/memories` | 🔒 Add a memory (`content`) |
 | PUT | `/api/memories/{id}` | 🔒 Edit a memory's content (`content`) |
 | DELETE | `/api/memories/{id}` | 🔒 Delete a memory |
+| GET | `/api/board` | Investigation board cards (`{cards[]}`) |
+| POST | `/api/board` | Pin a block (`kind` `code`\|`table`, `content`, `source_conv`, `source_title`) → `{card}`; lands in the `todo` column (public, like chat sends) |
+| PATCH | `/api/board/{id}` | Move/reorder a card (`col`, `pos`) — 404 if unknown |
+| DELETE | `/api/board/{id}` | Remove a pinned card |
 | POST | `/api/host/reboot` | 🔒 Reboot the host |
 | POST | `/api/newconversation` | Start an agent conversation → `{id}` |
 | POST | `/api/send/{id}` | Add a turn to a conversation (`message`) → `{answer}` (404 if unknown id) |
@@ -269,7 +274,8 @@ components/
   FeedbackModal.jsx  — submit feedback (title + optional description)
   FeedbackPanel.jsx  — read-only display of the feedback queue with statuses
   MemoriesCard.jsx   — browse/add/edit/delete the agent's durable memories (GET public; mutations admin-gated via runProtected)
-  AgentPanel.jsx     — assistant drawer: collapsible right-edge panel (fixed; pushes/squishes the dashboard via right-padding on .app). Active-conversation tabs across the top, standard chat below. Sends over WS /api/ws/agent and renders live tool-dispatch chips plus token-by-token streamed reasoning/answer text as they arrive (falls back to POST /api/send on WS failure). Past chats (persisted in `chat_sessions`) load on open and survive reloads — removed only via the per-tab × (DELETE /api/end). Desktop: drag the left edge to resize (width persisted in localStorage). Mobile: overlays instead of squishing.
+  AgentPanel.jsx     — assistant drawer: collapsible right-edge panel (fixed; pushes/squishes the dashboard via right-padding on .app). Active-conversation tabs across the top, standard chat below. Sends over WS /api/ws/agent and renders live tool-dispatch chips plus token-by-token streamed reasoning/answer text as they arrive (falls back to POST /api/send on WS failure). Past chats (persisted in `chat_sessions`) load on open and survive reloads — removed only via the per-tab × (DELETE /api/end). Desktop: drag the left edge to resize (width persisted in localStorage). Mobile: overlays instead of squishing. **Pins:** answer bubbles render through `makeMdComponents(rawContent, onPin)` — a per-message wrapper that overlays a 📌 on each fenced code block (`pre`, never inline code) and GFM table. Detection is the react-markdown/remark-gfm parser's job (no separate regex detector); the pinned block's exact source is sliced from `rawContent` via the node's remark `position` offsets. Pinning POSTs to `/api/board` and opens the InvestigationBoard. Only assistant bubbles get pins (not reasoning/user/tool/approval).
+  InvestigationBoard.jsx — full-screen "investigation mode" kanban overlay (one global board). Three fixed columns (To investigate / Looking / Resolved); cards are pinned code/table blocks rendered read-only via ReactMarkdown. Drag cards between columns / reorder (HTML5 DnD, fractional `pos` midpoint on drop → PATCH /api/board/{id}); drag empty lane to pan horizontally. Loads GET /api/board on open and on each new pin (refreshKey) — resumable via Postgres. × on a card → DELETE.
 ```
 
 ### Polling intervals

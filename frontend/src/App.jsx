@@ -27,6 +27,7 @@ import MemoriesCard from './components/MemoriesCard'
 import JobsCard from './components/JobsCard'
 import AddClientModal from './components/AddClientModal'
 import AgentPanel from './components/AgentPanel'
+import InvestigationBoard from './components/InvestigationBoard'
 import AskSelection from './components/AskSelection'
 
 const POLL_MS = 5000
@@ -75,9 +76,12 @@ export default function App() {
   const [rebooting, setRebooting] = useState(false)
   const [loginOpen, setLoginOpen] = useState(false)
   const [agentOpen, setAgentOpen] = useState(false)
+  const [boardOpen, setBoardOpen] = useState(false)
+  const [boardRefresh, setBoardRefresh] = useState(0)
   const [askContext, setAskContext] = useState(null)
   const [authUser, setAuthUser] = useState(currentUser())
   const pendingAction = useRef(null)
+  const headerRef = useRef(null)
 
   // Run a protected action; if unauthenticated (or token expired), prompt login
   // first and replay the action on success. This is the only thing that triggers
@@ -235,6 +239,20 @@ export default function App() {
     fetchJson('/api/directory').then(setDirectory)
   }, [])
 
+  // Publish the header's real height so fixed-position overlays (the investigation
+  // board) can start below it instead of guessing a constant — the header wraps to
+  // a second row on some widths.
+  useEffect(() => {
+    if (!headerRef.current) return
+    const setH = () => {
+      document.documentElement.style.setProperty('--header-height', `${headerRef.current.offsetHeight}px`)
+    }
+    setH()
+    const ro = new ResizeObserver(setH)
+    ro.observe(headerRef.current)
+    return () => ro.disconnect()
+  }, [])
+
   // History has its own loop so changing the zoom window refetches immediately
   // without restarting the other pollers.
   useEffect(() => {
@@ -245,7 +263,7 @@ export default function App() {
 
   return (
     <div className={`app${agentOpen ? ' agent-open' : ' agent-collapsed'}`}>
-      <header className="header">
+      <header className="header" ref={headerRef}>
         <div className="header-left">
           <button
             className="hamburger-btn"
@@ -266,6 +284,9 @@ export default function App() {
               <button className="logout-btn" onClick={logout} title="Log out">logout</button>
             </span>
           )}
+          <button className="board-header-btn" onClick={() => setBoardOpen(true)}>
+            Investigation
+          </button>
           <button className="feedback-header-btn" onClick={() => setFeedbackOpen(true)}>
             Feedback
           </button>
@@ -337,6 +358,13 @@ export default function App() {
         runProtected={runProtected}
         pendingContext={askContext}
         clearPendingContext={() => setAskContext(null)}
+        onPinned={() => { setBoardRefresh(n => n + 1); setBoardOpen(true) }}
+      />
+
+      <InvestigationBoard
+        open={boardOpen}
+        onClose={() => setBoardOpen(false)}
+        refreshKey={boardRefresh}
       />
 
       <AskSelection onAsk={(text) => { setAskContext(text); setAgentOpen(true) }} />
