@@ -1,0 +1,63 @@
+# Self-contained deployment stack: admindash + its Postgres.
+#
+#   cp .env.example .env      # then edit
+#   docker compose up --build -d
+#
+# Not used on the author's own host (that one runs admindash inside a larger,
+# shared compose). This file is for standalone deployments on other machines.
+
+services:
+  postgress:
+    image: postgres:16
+    container_name: postgress
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hackme}
+      POSTGRES_DB: ${POSTGRES_DB:-admindash}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  admindash:
+    build:
+      context: .
+    container_name: admindash
+    restart: unless-stopped
+    # TAVILY_API_KEY (and any AGENT_* / DATABASE_URL overrides) come from .env.
+    env_file:
+      - .env
+    environment:
+      # Wire the app to the bundled Postgres. Override in .env if you change the
+      # Postgres credentials/db above.
+      DATABASE_URL: ${DATABASE_URL:-postgresql://app:hackme@postgress:5432/admindash}
+    depends_on:
+      postgress:
+        condition: service_healthy
+    ports:
+      - "${ADMINDASH_PORT:-8090}:80"
+    volumes:
+      # Needed by the container/event collectors.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./directory.csv:/app/backend/directory.csv:ro
+    # Host-level collectors (processes, VMs, conntrack, SMART, cron, sessions)
+    # read the host's namespaces, so the container runs in them with elevated
+    # privileges.
+    pid: host
+    privileged: true
+    # GPU stats (nvidia-smi). Remove this block and the `deploy` block below on
+    # machines without an NVIDIA GPU / container runtime.
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+
+volumes:
+  pgdata:
