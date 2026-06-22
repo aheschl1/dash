@@ -26,23 +26,26 @@ All vars are optional:
 
 ## Docker setup
 
-The app ships as one container (nginx + FastAPI via supervisord) and depends on a
-Postgres service, wired up by a `docker-compose.yml`.
+The app runs as one container (nginx + FastAPI via supervisord). The root
+`docker-compose.yml` is a self-contained stack — admindash plus its Postgres:
 
 ```bash
-bash scripts/deploy.sh        # build + (re)start the container
-bash scripts/healthcheck.sh   # verify the running app
-bash scripts/create_admin.sh  # set the admin login (interactive)
+cp .env.example .env          # configure (see above)
+docker compose up --build -d  # build + start admindash and Postgres
 ```
 
-The scripts resolve paths relative to the repo and accept env overrides:
+Then, from the host (the container must be running), set an admin login and
+verify:
 
-| Var | Used by | Default |
-|---|---|---|
-| `COMPOSE_DIR` | deploy | `../builds` (dir holding `docker-compose.yml`) |
-| `COMPOSE_SERVICE` | deploy | `admindash` |
-| `ADMINDASH_CONTAINER` | healthcheck, create_admin | `admindash` |
-| `DASH_URL` | healthcheck | `https://10.8.0.1` |
+```bash
+bash scripts/create_admin.sh                          # interactive
+DASH_URL=http://localhost:8090 bash scripts/healthcheck.sh
+```
+
+Override defaults via `.env` (e.g. `ADMINDASH_PORT`, `POSTGRES_PASSWORD`). The
+dashboard is served on `http://localhost:${ADMINDASH_PORT:-8090}`. Remove the
+`runtime: nvidia` / `deploy` blocks from the compose file on machines without an
+NVIDIA GPU.
 
 ## Local setup
 
