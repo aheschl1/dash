@@ -1,5 +1,11 @@
+import os
 import subprocess
 import re
+
+# The host WireGuard interface to inspect. Defaults to wg0; override with
+# WG_INTERFACE when the host (or a peer like a laptop) names it differently
+# (e.g. wg0-client). Shared with collectors/vpn.py.
+WG_INTERFACE = os.environ.get("WG_INTERFACE", "wg0")
 
 
 def _nsenter(cmd: list[str]) -> str:
@@ -11,7 +17,7 @@ def _nsenter(cmd: list[str]) -> str:
 
 def _interface_ip() -> str | None:
     try:
-        out = _nsenter(["ip", "addr", "show", "wg0"])
+        out = _nsenter(["ip", "addr", "show", WG_INTERFACE])
         m = re.search(r"inet (\S+)", out)
         return m.group(1) if m else None
     except Exception:
@@ -20,7 +26,7 @@ def _interface_ip() -> str | None:
 
 def _peers() -> list[dict]:
     try:
-        out = _nsenter(["wg", "show"])
+        out = _nsenter(["wg", "show", WG_INTERFACE])
     except Exception:
         return []
 

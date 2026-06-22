@@ -6,9 +6,10 @@ from . import wireguard
 
 # The host's setuid VPN management CLI. Reached through the host mount/net
 # namespaces (pid 1) because it lives on the host filesystem and edits the
-# host's wg0 config — same nsenter technique the read-only collectors use.
+# host's wg config — same nsenter technique the read-only collectors use.
 ADMIN_BIN = "/home/andrew/.cargo/bin/admin"
-WG_INTERFACE = "wg0"
+# Interface name is shared with the wireguard collector (WG_INTERFACE env override).
+WG_INTERFACE = wireguard.WG_INTERFACE
 VPN_SUBNET = ipaddress.ip_network("10.8.0.0/24")
 SERVER_IP = ipaddress.ip_address("10.8.0.1")
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
