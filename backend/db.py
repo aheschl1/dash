@@ -7,7 +7,9 @@ from datetime import datetime, timezone
 
 import auth
 
-DSN = "postgresql://app:hackme@postgress:5432/admindash"
+# Connection string. Defaults to the in-compose Postgres service; override with
+# DATABASE_URL on another machine (different host/credentials/db name).
+DSN = os.environ.get("DATABASE_URL", "postgresql://app:hackme@postgress:5432/admindash")
 
 RETENTION_SECONDS = 24 * 3600
 
@@ -52,6 +54,10 @@ CREATE TABLE IF NOT EXISTS users (
     created_at    BIGINT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS auth_config (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS app_config (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
@@ -203,6 +209,36 @@ def get_auth_secret() -> str:
         row = con.execute("SELECT value FROM auth_config WHERE key='token_secret'").fetchone()
     _secret_cache = row[0]
     return _secret_cache
+
+
+def get_app_config(keys: "list[str] | tuple[str, ...]") -> dict[str, str]:
+    """Fetch runtime app-config values by key. Missing keys are simply absent
+    from the result (callers fall back to env/defaults). Used for the agent's
+    LLM endpoint/model, which are editable at runtime without a redeploy."""
+    if not keys:
+        return {}
+    with psycopg.connect(DSN) as con:
+        rows = con.execute(
+            "SELECT key, value FROM app_config WHERE key = ANY(%s)",
+            (list(keys),),
+        ).fetchall()
+    return {k: v for k, v in rows}
+
+
+def set_app_config(values: dict[str, str]) -> None:
+    """Upsert runtime app-config values. A None/empty value deletes the key so
+    the resolver falls back to the env default."""
+    with psycopg.connect(DSN) as con:
+        for key, value in values.items():
+            if value is None or value == "":
+                con.execute("DELETE FROM app_config WHERE key=%s", (key,))
+            else:
+                con.execute(
+                    "INSERT INTO app_config (key, value) VALUES (%s, %s) "
+                    "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+                    (key, value),
+                )
+        con.commit()
 
 
 def create_user(username: str, password: str, role: str = "admin") -> None:

@@ -10,6 +10,9 @@
 
 set -euo pipefail
 
+# Container name (override on machines that renamed the service).
+CONTAINER="${ADMINDASH_CONTAINER:-admindash}"
+
 USER_NAME="${ADMIN_USER:-}"
 PASS="${ADMIN_PASS:-}"
 
@@ -25,7 +28,7 @@ fi
 [[ -n "$USER_NAME" && -n "$PASS" ]] || { echo "username and password required" >&2; exit 1; }
 [[ ${#PASS} -ge 8 ]] || { echo "password must be at least 8 characters" >&2; exit 1; }
 
-docker exec -e ADMIN_U="$USER_NAME" -e ADMIN_P="$PASS" -w /app/backend admindash \
+docker exec -e ADMIN_U="$USER_NAME" -e ADMIN_P="$PASS" -w /app/backend "$CONTAINER" \
     /app/backend/.venv/bin/python -c '
 import os, db
 db.create_user(os.environ["ADMIN_U"], os.environ["ADMIN_P"], "admin")

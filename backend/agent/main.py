@@ -1,10 +1,9 @@
 """Tool-calling agent over an OpenAI-compatible endpoint.
 
-The LLM runs on the local llama-cpp container (OpenAI-compatible server on
-wg-network), not api.openai.com. The core `_run_loop` advances a message list
-through tool calls to a final answer; `continue_conversation` drives it for the
-multi-turn conversation store, which keeps the list alive between requests (see
-store.py).
+The endpoint/model are resolved per request (see resolve_llm_config). The core
+`_run_loop` advances a message list through tool calls to a final answer;
+`continue_conversation` drives it for the multi-turn conversation store, which
+keeps the list alive between requests (see store.py).
 """
 import json
 import os
@@ -26,24 +25,57 @@ from .prompt import (
     build_system_prompt,
 )
 
-# llama-cpp's OpenAI-compatible server, reachable by container name over
-# wg-network. The SDK appends /chat/completions to this base. llama.cpp does
-# not authenticate, but the SDK requires a non-empty key, so send a placeholder.
-LLM_BASE_URL = os.environ.get("AGENT_LLM_BASE_URL", "http://llama-cpp:8080/v1")
-LLM_API_KEY = os.environ.get("AGENT_LLM_API_KEY", "no-key")
-MODEL = os.environ.get("AGENT_MODEL", "Qwen_Qwen3.5-9B-Q6_K.gguf")
+# OpenAI-compatible base URL; the SDK appends /chat/completions to it. The SDK
+# requires a non-empty key even when the endpoint doesn't authenticate, so a
+# placeholder is sent by default. These env values are only the DEFAULTS: the
+# live endpoint/model are resolved per request from DB → env → default (see
+# resolve_llm_config), so an admin can point the agent at a different machine's
+# LLM at runtime with no redeploy.
+DEFAULT_LLM_BASE_URL = os.environ.get("AGENT_LLM_BASE_URL", "http://llama-cpp:8080/v1")
+DEFAULT_LLM_API_KEY = os.environ.get("AGENT_LLM_API_KEY", "no-key")
+DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "Qwen_Qwen3.5-9B-Q6_K.gguf")
 MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "6"))
 
-# Qwen3.5 is a reasoning model: llama.cpp's chat template (needs --jinja) routes
-# <think>…</think> into a separate `reasoning_content` field. It intermittently
-# spends the whole generation there and emits an EMPTY user-facing `content` — or
-# "thinks" about a follow-up tool call but never emits it, then stops. Both surface
-# as a blank answer. Rather than disable thinking (it improves tool selection), we
-# nudge the model off the record to actually emit its answer (see _run_loop).
+# Keys under which the runtime LLM overrides live in the app_config table.
+_CFG_BASE_URL = "agent_llm_base_url"
+_CFG_API_KEY = "agent_llm_api_key"
+_CFG_MODEL = "agent_model"
+
+# Reasoning models route <think>…</think> into a separate `reasoning_content`
+# field. One intermittently spends the whole generation there and emits an EMPTY
+# user-facing `content` — or "thinks" about a follow-up tool call but never emits
+# it, then stops. Both surface as a blank answer. Rather than disable thinking (it
+# improves tool selection), we nudge the model off the record to actually emit its
+# answer (see _run_loop).
 EMPTY_NUDGE = "(Your last reply was empty. Give your final answer now, in plain text.)"
 EMPTY_RETRIES = int(os.environ.get("AGENT_EMPTY_RETRIES", "2"))
 
-client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
+# OpenAI SDK clients are cached per (base_url, api_key) so we don't rebuild one
+# on every completion, but a runtime endpoint change is picked up automatically
+# (the new tuple misses the cache). Constructing a client does no network I/O.
+_client_cache: dict[tuple[str, str], OpenAI] = {}
+
+
+def resolve_llm_config() -> dict[str, str]:
+    """Resolve the live LLM endpoint/key/model: DB override → env → default.
+
+    Read fresh per request so an admin editing the config (PUT /api/agent/config)
+    takes effect on the next turn without a redeploy or restart."""
+    cfg = db.get_app_config((_CFG_BASE_URL, _CFG_API_KEY, _CFG_MODEL))
+    return {
+        "base_url": cfg.get(_CFG_BASE_URL) or DEFAULT_LLM_BASE_URL,
+        "api_key": cfg.get(_CFG_API_KEY) or DEFAULT_LLM_API_KEY,
+        "model": cfg.get(_CFG_MODEL) or DEFAULT_MODEL,
+    }
+
+
+def _client_for(base_url: str, api_key: str) -> OpenAI:
+    key = (base_url, api_key)
+    c = _client_cache.get(key)
+    if c is None:
+        c = OpenAI(base_url=base_url, api_key=api_key)
+        _client_cache[key] = c
+    return c
 
 TOOLS = [
     {
@@ -511,7 +543,7 @@ class _StreamedMessage:
 def _stream_completion(messages: list[dict], cancel: "CancelToken | None", on_delta=None) -> "_StreamedMessage | None":
     """Run one chat completion in streaming mode, reassembling the deltas into a
     single message. Returns None if `cancel` is tripped mid-stream — we close the
-    stream (aborting the HTTP request, so llama.cpp stops generating) and discard
+    stream (aborting the HTTP request, so the server stops generating) and discard
     the partial output, leaving nothing appended to the caller's message list.
 
     We stream so a long generation can be interrupted, AND — when `on_delta` is
@@ -519,8 +551,9 @@ def _stream_completion(messages: list[dict], cancel: "CancelToken | None", on_de
     `answer_delta`/`reasoning_delta` events; the reassembled message is still handed
     back whole, exactly as the blocking call used to return it (the loop and the
     persisted history are unchanged — the deltas are display-only)."""
-    stream = client.chat.completions.create(
-        model=MODEL,
+    cfg = resolve_llm_config()
+    stream = _client_for(cfg["base_url"], cfg["api_key"]).chat.completions.create(
+        model=cfg["model"],
         messages=messages,
         tools=TOOLS,
         stream=True,
@@ -601,9 +634,9 @@ def _run_loop(messages: list[dict], on_event=None, request_approval=None, conv_i
         if msg is None:
             raise TurnCanceled()
 
-        # Reasoning models (Qwen3.5, Gemma-4) route their chain-of-thought into a
-        # separate `reasoning_content` field (llama.cpp --jinja --reasoning). Stream
-        # it live so the panel can show the thinking, and attach it to the persisted
+        # Reasoning models route their chain-of-thought into a separate
+        # `reasoning_content` field. Stream it live so the panel can show the
+        # thinking, and attach it to the persisted
         # assistant turn below so a reloaded chat shows it too. It is stripped back
         # out before the next LLM call (see _strip_reasoning) so it never re-enters
         # the model's context.

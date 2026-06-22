@@ -17,6 +17,13 @@ bash scripts/deploy.sh        # rebuild + restart admindash
 bash scripts/healthcheck.sh   # verify the running app (exits non-zero on failure)
 ```
 
+The scripts are **machine-portable**: paths are derived from the script's own
+location, with env overrides for non-default layouts — `COMPOSE_DIR` (dir holding
+the compose file, default `../builds`), `COMPOSE_SERVICE` (default `admindash`),
+`ADMINDASH_CONTAINER` (container name, used by healthcheck/create_admin),
+`DASH_URL` (healthcheck ingress, default `https://10.8.0.1`). On a fresh machine,
+`cp .env.example .env` first (see README → "Running on another machine").
+
 The container depends on `postgress` (postgres:16) being healthy. The compose file is at `/home/andrew/docker_deployments/builds/docker-compose.yml`. The admindash service runs with `pid: host`, `privileged: true`, `runtime: nvidia`, and mounts `/var/run/docker.sock`.
 
 The **agent** (see Backend → Agent) additionally needs the `llama-cpp` container running and reachable over `wg-network` — it is the LLM backend. The rest of the dashboard works without it; only the agent (`/api/send`, `WS /api/ws/agent`) degrades (errors) if llama-cpp is down.
@@ -45,7 +52,7 @@ Mutating endpoints (🔒 in the API table) require an admin token; all GETs and 
 **Location:** `backend/`  
 **Entry point:** `backend/main.py` (FastAPI + APScheduler)  
 **Package manager:** `uv` — add deps with `uv add <package>` which updates `pyproject.toml`. The Dockerfile runs `uv sync --no-dev`.  
-**DB:** PostgreSQL via `psycopg[binary]` — DSN in `backend/db.py`: `postgresql://app:hackme@postgress:5432/admindash`
+**DB:** PostgreSQL via `psycopg[binary]` — DSN in `backend/db.py`, env-driven via `DATABASE_URL` (defaults to the in-compose `postgresql://app:hackme@postgress:5432/admindash`; override on another machine).
 
 ### Collectors (`backend/collectors/`)
 
@@ -76,6 +83,17 @@ Each collector has a `collect()` function. The host network/mount namespace is a
 A natural-language assistant over the dashboard's own data. The LLM runs on the
 local **llama-cpp** container (OpenAI-compatible server at `http://llama-cpp:8080/v1`,
 reachable by name over `wg-network`), not api.openai.com. Uses the `openai` SDK.
+
+**LLM endpoint/model are runtime-configurable.** `main.resolve_llm_config()` resolves
+the base URL, API key, and model fresh per request in the order **DB override → env
+default** (env vars `AGENT_LLM_BASE_URL`/`AGENT_LLM_API_KEY`/`AGENT_MODEL` are only the
+defaults). The DB override lives in the `app_config` table (keys `agent_llm_base_url` /
+`agent_llm_api_key` / `agent_model`), edited via `GET`/`PUT /api/agent/config` (PUT
+admin-gated) and the global ⚙ settings modal in the app header — so the agent can be
+pointed at a different machine's LLM with no redeploy. OpenAI SDK clients are cached
+per `(base_url, api_key)` in `_client_for`. `GET /api/agent/models` proxies the
+endpoint's `/v1/models` so the UI can offer a model dropdown. Both `main.py` and
+`reflect.py` go through `resolve_llm_config()`/`_client_for()`.
 
 **Tavily key:** `web_search` reads `TAVILY_API_KEY` from the env — never hardcoded.
 It lives in `admindash/.env` (gitignored-by-intent; not committed) and is loaded
@@ -185,6 +203,7 @@ docker_events — ts, action, container, image (last 200 rows)
 feedback      — id, type (vestigial, always 'feedback'), title, description, status, created_at, resolved_at, resolution_note
 users         — id, username (unique), password_hash, salt, role, created_at (admin accounts)
 auth_config   — key/value; holds the persisted token-signing secret ('token_secret')
+app_config    — key/value; runtime app overrides (agent LLM endpoint/key/model); survives rebuilds, falls back to env when a key is absent
 chat_sessions — id (uuid), title, turns, messages (JSONB raw message list), created_at, updated_at (persisted agent chats; most-recent-N retained)
 board_cards   — id, kind ('code'|'table'), content (raw markdown block), col ('todo'|'looking'|'done'), pos (fractional sort key), source_conv, source_title, created_at (investigation-board pins; one global board)
 ```
@@ -228,6 +247,9 @@ board_cards   — id, kind ('code'|'table'), content (raw markdown block), col (
 | POST | `/api/memories` | 🔒 Add a memory (`content`) |
 | PUT | `/api/memories/{id}` | 🔒 Edit a memory's content (`content`) |
 | DELETE | `/api/memories/{id}` | 🔒 Delete a memory |
+| GET | `/api/agent/config` | Live agent LLM config (`base_url`, `model`, `api_key_set`, `overridden`, `defaults`); never returns the key value |
+| PUT | `/api/agent/config` | 🔒 Set runtime LLM `base_url`/`model`/`api_key` (empty string clears an override → env default; omit a field to leave it) |
+| GET | `/api/agent/models` | Proxy the configured endpoint's `/v1/models` (`{available, models[]}`) for the UI dropdown |
 | GET | `/api/board` | Investigation board cards (`{cards[]}`) |
 | POST | `/api/board` | Pin a block (`kind` `code`\|`table`, `content`, `source_conv`, `source_title`) → `{card}`; lands in the `todo` column (public, like chat sends) |
 | PATCH | `/api/board/{id}` | Move/reorder a card (`col`, `pos`) — 404 if unknown |
@@ -271,6 +293,7 @@ components/
   HistoryChart.jsx   — 24h sparkline (Recharts) for CPU/GPU/RAM
   LogsModal.jsx      — container log viewer (bottom sheet mobile / centered desktop)
   LoginModal.jsx     — admin login (shown only when a protected action needs auth)
+  AgentConfigModal.jsx — edit the agent's LLM endpoint/model/key at runtime; opened from the global ⚙ button in the App header (not tied to the chat panel). GET /api/agent/config + /api/agent/models public, PUT admin-gated via runProtected. Model field is a datalist fed by /api/agent/models.
   FeedbackModal.jsx  — submit feedback (title + optional description)
   FeedbackPanel.jsx  — read-only display of the feedback queue with statuses
   MemoriesCard.jsx   — browse/add/edit/delete the agent's durable memories (GET public; mutations admin-gated via runProtected)

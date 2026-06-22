@@ -1,4 +1,6 @@
+import json
 import subprocess
+import urllib.request
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query, Body, Header, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,6 +9,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import docker as docker_sdk
 
 import auth
+import db
 from db import (init_db, insert_snapshot, query_history, insert_event, query_events,
                insert_feedback, list_feedback, update_feedback_status,
                get_auth_secret, get_user, set_password,
@@ -16,6 +19,8 @@ from db import (init_db, insert_snapshot, query_history, insert_event, query_eve
 from collectors import system, gpu, temps, containers, ports, wireguard, disk, processes, network, connections
 from collectors import events as events_collector, smart, alerts, sessions, hardware, vms, cron, directory, vpn
 from agent import router as agent_router
+from agent import main as agent_main
+from agent.main import resolve_llm_config as agent_resolve_llm_config
 from agent.reflect import run_nightly_reflection
 
 
@@ -388,6 +393,75 @@ def remove_memory(id: int, user: dict = Depends(require_admin)):
     if not memory_delete(id):
         return JSONResponse(status_code=404, content={"error": "unknown memory"})
     return {"deleted": id}
+
+
+# ── Agent LLM config ────────────────────────────────────────────────────────────
+# The agent's LLM endpoint/model are editable at runtime (DB-backed, survives
+# rebuilds) so the dashboard can be pointed at a different machine's LLM without a
+# redeploy. Resolution order is DB override → env default (see agent.main). Reading
+# the config is public (no secrets leak — the API key is returned only as a boolean
+# "is it set"); changing it is admin-gated.
+
+
+@app.get("/api/agent/config")
+def get_agent_config():
+    cfg = agent_resolve_llm_config()
+    overrides = db.get_app_config((agent_main._CFG_BASE_URL, agent_main._CFG_API_KEY, agent_main._CFG_MODEL))
+    return {
+        "base_url": cfg["base_url"],
+        "model": cfg["model"],
+        "api_key_set": bool(cfg["api_key"] and cfg["api_key"] != "no-key"),
+        # which fields are runtime overrides vs. falling back to the env default
+        "overridden": {
+            "base_url": agent_main._CFG_BASE_URL in overrides,
+            "model": agent_main._CFG_MODEL in overrides,
+            "api_key": agent_main._CFG_API_KEY in overrides,
+        },
+        "defaults": {
+            "base_url": agent_main.DEFAULT_LLM_BASE_URL,
+            "model": agent_main.DEFAULT_MODEL,
+        },
+    }
+
+
+@app.put("/api/agent/config")
+def set_agent_config(
+    base_url: str | None = Body(default=None),
+    model: str | None = Body(default=None),
+    api_key: str | None = Body(default=None),
+    user: dict = Depends(require_admin),
+):
+    # Only keys present in the body are touched. An empty string clears the
+    # override (falls back to the env default); a missing key is left as-is. A
+    # sentinel lets the caller omit api_key without clearing the stored one.
+    updates: dict[str, str] = {}
+    if base_url is not None:
+        updates[agent_main._CFG_BASE_URL] = base_url.strip()
+    if model is not None:
+        updates[agent_main._CFG_MODEL] = model.strip()
+    if api_key is not None:
+        updates[agent_main._CFG_API_KEY] = api_key.strip()
+    if updates:
+        db.set_app_config(updates)
+    return get_agent_config()
+
+
+@app.get("/api/agent/models")
+def list_agent_models():
+    """Query the configured LLM endpoint's /v1/models so the UI can offer a
+    dropdown instead of a free-text model name. Returns {available, models[]};
+    `available` is False (with `error`) if the endpoint is unreachable."""
+    cfg = agent_resolve_llm_config()
+    base = cfg["base_url"].rstrip("/")
+    url = base + ("/models" if base.endswith("/v1") else "/v1/models")
+    try:
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {cfg['api_key']}"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.load(resp)
+        models = [m.get("id") for m in data.get("data", []) if m.get("id")]
+        return {"available": True, "models": models}
+    except Exception as e:
+        return {"available": False, "models": [], "error": str(e)}
 
 
 # ── Investigation board ───────────────────────────────────────────────────────

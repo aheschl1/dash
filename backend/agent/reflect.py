@@ -15,7 +15,7 @@ import os
 import time
 
 import db
-from .main import MODEL, client
+from .main import resolve_llm_config, _client_for
 
 BATCH_SIZE = int(os.environ.get("AGENT_REFLECTION_BATCH", "20"))
 
@@ -79,8 +79,9 @@ def _reflect_one(conv_id: str, memories: list[dict]) -> dict:
     mem_block = "\n".join(f"[{m['id']}] {m['content']}" for m in memories) or "(none yet)"
     prompt = f"Current memories:\n{mem_block}\n\nConversation transcript:\n{transcript}"
     try:
-        resp = client.chat.completions.create(
-            model=MODEL,
+        cfg = resolve_llm_config()
+        resp = _client_for(cfg["base_url"], cfg["api_key"]).chat.completions.create(
+            model=cfg["model"],
             messages=[
                 {"role": "system", "content": REFLECTION_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},

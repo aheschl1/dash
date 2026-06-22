@@ -8,8 +8,10 @@ set -uo pipefail
 
 # Served via the shared nginx proxy over HTTPS. Bare-IP https://10.8.0.1 hits
 # the admindash default_server, so this works with no DNS dependency (the cert
-# won't match the IP -> curl -k below stays lenient).
+# won't match the IP -> curl -k below stays lenient). Override DASH_URL on a
+# machine with a different ingress IP/host; CONTAINER for a renamed service.
 DASH_URL="${DASH_URL:-https://10.8.0.1}"
+CONTAINER="${ADMINDASH_CONTAINER:-admindash}"
 FAIL=0
 
 step() { echo "[$1] $2"; }
@@ -21,7 +23,7 @@ sleep 8
 ok
 
 step 2 "Container status"
-status=$(docker ps --filter name=admindash --format '{{.Status}}' 2>/dev/null || echo "")
+status=$(docker ps --filter "name=$CONTAINER" --format '{{.Status}}' 2>/dev/null || echo "")
 if [[ -z "$status" || "$status" != Up* ]]; then
     fail "container not running (status: ${status:-none})"
 else
@@ -52,8 +54,8 @@ else
     ok
 fi
 
-step 5b "API /api/containers/admindash/stats"
-if ! curl -skf --max-time 10 "$DASH_URL/api/containers/admindash/stats" \
+step 5b "API /api/containers/$CONTAINER/stats"
+if ! curl -skf --max-time 10 "$DASH_URL/api/containers/$CONTAINER/stats" \
     | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'cpu_pct' in d and 'usage_bytes' in d.get('memory',{}) and 'rx_bytes_total' in d.get('network',{}) and 'read_bytes_total' in d.get('block_io',{}), 'missing stat fields'" 2>/dev/null; then
     fail "/api/containers/{name}/stats missing or invalid"
 else
@@ -172,7 +174,7 @@ step 12c "Agent WebSocket upgrade + endpoint (no LLM call)"
 # Connect through the inner nginx (localhost:80 inside the container) to verify
 # the /api/ws/ upgrade block and the endpoint. Sending a bogus conv_id yields an
 # error event without invoking llama-cpp.
-if docker exec -i admindash /app/backend/.venv/bin/python - <<'PY' 2>/dev/null
+if docker exec -i "$CONTAINER" /app/backend/.venv/bin/python - <<'PY' 2>/dev/null
 import asyncio, json, websockets
 async def main():
     async with websockets.connect("ws://localhost:80/api/ws/agent") as ws:
@@ -190,16 +192,16 @@ fi
 step 12d "Agent: TAVILY_API_KEY present in container env"
 # Confirms the compose env_file wired admindash/.env into the container. Checks
 # presence only — never prints the value.
-if docker exec admindash sh -c '[ -n "$TAVILY_API_KEY" ]' 2>/dev/null; then
+if docker exec "$CONTAINER" sh -c '[ -n "$TAVILY_API_KEY" ]' 2>/dev/null; then
     ok
 else
     fail "TAVILY_API_KEY not set in container (env_file / .env wiring) — web_search disabled"
 fi
 
 step 13 "Backend tracebacks in recent logs"
-if docker logs admindash --tail 50 2>&1 | grep -q "Traceback"; then
+if docker logs "$CONTAINER" --tail 50 2>&1 | grep -q "Traceback"; then
     fail "Python traceback found in logs"
-    docker logs admindash --tail 30 2>&1 | grep -A 5 "Traceback" | head -40
+    docker logs "$CONTAINER" --tail 30 2>&1 | grep -A 5 "Traceback" | head -40
 else
     ok
 fi
@@ -209,6 +211,6 @@ if [[ $FAIL -eq 0 ]]; then
     echo "All health checks passed."
     exit 0
 else
-    echo "Health check FAILED. Run: docker logs admindash --tail 100"
+    echo "Health check FAILED. Run: docker logs $CONTAINER --tail 100"
     exit 1
 fi

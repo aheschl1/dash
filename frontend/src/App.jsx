@@ -27,6 +27,7 @@ import MemoriesCard from './components/MemoriesCard'
 import JobsCard from './components/JobsCard'
 import AddClientModal from './components/AddClientModal'
 import AgentPanel from './components/AgentPanel'
+import AgentConfigModal from './components/AgentConfigModal'
 import InvestigationBoard from './components/InvestigationBoard'
 import AskSelection from './components/AskSelection'
 
@@ -75,6 +76,7 @@ export default function App() {
   const [rebootConfirm, setRebootConfirm] = useState(false)
   const [rebooting, setRebooting] = useState(false)
   const [loginOpen, setLoginOpen] = useState(false)
+  const [agentConfigOpen, setAgentConfigOpen] = useState(false)
   const [agentOpen, setAgentOpen] = useState(false)
   const [boardOpen, setBoardOpen] = useState(false)
   const [boardRefresh, setBoardRefresh] = useState(0)
@@ -289,6 +291,14 @@ export default function App() {
             Feedback
           </button>
           <button
+            className="agent-config-header-btn"
+            onClick={() => setAgentConfigOpen(true)}
+            title="Agent LLM endpoint settings"
+            aria-label="Agent LLM endpoint settings"
+          >
+            ⚙
+          </button>
+          <button
             className={`reboot-header-btn${rebootConfirm ? ' confirm' : ''}`}
             disabled={rebooting}
             onClick={() => {
@@ -394,6 +404,9 @@ export default function App() {
       )}
       {addClientOpen && (
         <AddClientModal onClose={() => setAddClientOpen(false)} onCreated={poll} />
+      )}
+      {agentConfigOpen && (
+        <AgentConfigModal onClose={() => setAgentConfigOpen(false)} runProtected={runProtected} />
       )}
       {loginOpen && (
         <LoginModal
