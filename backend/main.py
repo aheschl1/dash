@@ -6,6 +6,7 @@ from fastapi import FastAPI, Query, Body, Header, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 import docker as docker_sdk
 
 import auth
@@ -42,6 +43,40 @@ def _collect_and_store() -> None:
     )
 
 
+# The nightly self-reflection ("memory") job is runtime-configurable (DB-backed,
+# survives rebuilds): it can be turned off and rescheduled from settings without a
+# redeploy. Keys live in app_config; absent keys fall back to enabled @ 00:00.
+_CFG_REFLECT_ENABLED = "reflect_enabled"
+_CFG_REFLECT_HOUR = "reflect_hour"
+_CFG_REFLECT_MINUTE = "reflect_minute"
+
+
+def _reflect_config() -> dict:
+    cfg = db.get_app_config((_CFG_REFLECT_ENABLED, _CFG_REFLECT_HOUR, _CFG_REFLECT_MINUTE))
+    enabled = cfg.get(_CFG_REFLECT_ENABLED)
+    return {
+        "enabled": enabled != "0" if enabled is not None else True,
+        "hour": int(cfg.get(_CFG_REFLECT_HOUR) or 0),
+        "minute": int(cfg.get(_CFG_REFLECT_MINUTE) or 0),
+    }
+
+
+def _apply_reflect_schedule(scheduler) -> dict:
+    """(Re)install or remove the 'reflect' job to match the stored config.
+    Idempotent — safe to call at startup and after every config change."""
+    cfg = _reflect_config()
+    if cfg["enabled"]:
+        scheduler.add_job(
+            run_nightly_reflection,
+            CronTrigger(hour=cfg["hour"], minute=cfg["minute"]),
+            id="reflect", max_instances=1, misfire_grace_time=3600,
+            replace_existing=True,
+        )
+    elif scheduler.get_job("reflect") is not None:
+        scheduler.remove_job("reflect")
+    return cfg
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -51,12 +86,9 @@ async def lifespan(app: FastAPI):
         lambda: events_collector.poll_and_store(insert_event),
         "interval", seconds=15, id="events"
     )
-    scheduler.add_job(
-        run_nightly_reflection, "cron", hour=0, minute=0,
-        id="reflect", max_instances=1, misfire_grace_time=3600,
-    )
-    scheduler.start()
     app.state.scheduler = scheduler
+    _apply_reflect_schedule(scheduler)
+    scheduler.start()
     _collect_and_store()
     events_collector.poll_and_store(insert_event)
     yield
@@ -527,5 +559,44 @@ def get_jobs():
 def get_reflection_runs():
     """Audit log of the nightly self-reflection job (public, read-only)."""
     return {"runs": reflection_run_list()}
+
+
+@app.get("/api/agent/reflection-config")
+def get_reflection_config():
+    """Whether the nightly memory-reflection job runs, and when (public, read-only)."""
+    cfg = _reflect_config()
+    next_run = None
+    sched = getattr(app.state, "scheduler", None)
+    if sched is not None:
+        job = sched.get_job("reflect")
+        if job is not None and job.next_run_time is not None:
+            next_run = job.next_run_time.isoformat()
+    return {**cfg, "next_run_time": next_run}
+
+
+@app.put("/api/agent/reflection-config")
+def set_reflection_config(
+    enabled: bool | None = Body(default=None),
+    hour: int | None = Body(default=None),
+    minute: int | None = Body(default=None),
+    user: dict = Depends(require_admin),
+):
+    updates: dict[str, str] = {}
+    if enabled is not None:
+        updates[_CFG_REFLECT_ENABLED] = "1" if enabled else "0"
+    if hour is not None:
+        if not 0 <= hour <= 23:
+            return JSONResponse(status_code=400, content={"error": "hour must be 0-23"})
+        updates[_CFG_REFLECT_HOUR] = str(hour)
+    if minute is not None:
+        if not 0 <= minute <= 59:
+            return JSONResponse(status_code=400, content={"error": "minute must be 0-59"})
+        updates[_CFG_REFLECT_MINUTE] = str(minute)
+    if updates:
+        db.set_app_config(updates)
+    sched = getattr(app.state, "scheduler", None)
+    if sched is not None:
+        _apply_reflect_schedule(sched)
+    return get_reflection_config()
 
 

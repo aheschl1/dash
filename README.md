@@ -24,6 +24,10 @@ All vars are optional:
   endpoint (any OpenAI-compatible server). Also editable at runtime.
 - `DATABASE_URL` — Postgres DSN (defaults to the in-compose `postgress` service).
 
+> **Set a real Postgres password for any real deployment.** The bundled default
+> is `hackme` (see `POSTGRES_PASSWORD` / `DATABASE_URL` in `.env`); change both to
+> match before exposing the stack.
+
 ## Docker setup
 
 The app runs as one container (nginx + FastAPI via supervisord). The root
@@ -41,6 +45,9 @@ verify:
 bash scripts/create_admin.sh                          # interactive
 DASH_URL=http://localhost:8090 bash scripts/healthcheck.sh
 ```
+
+Admin passwords are never stored in plaintext — `create_admin.sh` saves a salted
+PBKDF2-HMAC-SHA256 hash in Postgres.
 
 Override defaults via `.env` (e.g. `ADMINDASH_PORT`, `POSTGRES_PASSWORD`). The
 dashboard is served on `http://localhost:${ADMINDASH_PORT:-8090}`. Remove the

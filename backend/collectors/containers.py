@@ -99,9 +99,14 @@ def collect() -> list[dict]:
         if c.attrs.get("State", {}).get("Health"):
             health = c.attrs["State"]["Health"].get("Status", "none")
 
+        image = c.attrs.get("Config", {}).get("Image") or ""
+        if not image:
+            image_id = c.attrs.get("Image", "")
+            image = image_id.split(":", 1)[-1][:12] if image_id else "unknown"
+
         result.append({
             "name": c.name,
-            "image": c.image.tags[0] if c.image.tags else c.image.short_id,
+            "image": image,
             "status": c.status,
             "health": health,
             "ports": ports,

@@ -194,6 +194,7 @@ double-run and the timeout always releases the worker.
 
 - Every 60s: `_collect_and_store()` → inserts into `metrics` table
 - Every 15s: `events_collector.poll_and_store()` → inserts into `docker_events` table
+- Nightly `run_nightly_reflection` (the "memory" job): **runtime-configurable** — can be turned off and rescheduled from the ⚙ settings modal without a redeploy. `_apply_reflect_schedule()` (re)installs/removes the `reflect` job to match the DB config (`app_config` keys `reflect_enabled` / `reflect_hour` / `reflect_minute`; default enabled @ 00:00), called at startup and after every `PUT /api/agent/reflection-config`.
 
 ### Database schema (`backend/db.py`)
 
@@ -203,7 +204,7 @@ docker_events — ts, action, container, image (last 200 rows)
 feedback      — id, type (vestigial, always 'feedback'), title, description, status, created_at, resolved_at, resolution_note
 users         — id, username (unique), password_hash, salt, role, created_at (admin accounts)
 auth_config   — key/value; holds the persisted token-signing secret ('token_secret')
-app_config    — key/value; runtime app overrides (agent LLM endpoint/key/model); survives rebuilds, falls back to env when a key is absent
+app_config    — key/value; runtime app overrides (agent LLM endpoint/key/model; nightly-reflection enabled/hour/minute); survives rebuilds, falls back to env/defaults when a key is absent
 chat_sessions — id (uuid), title, turns, messages (JSONB raw message list), created_at, updated_at (persisted agent chats; most-recent-N retained)
 board_cards   — id, kind ('code'|'table'), content (raw markdown block), col ('todo'|'looking'|'done'), pos (fractional sort key), source_conv, source_title, created_at (investigation-board pins; one global board)
 ```
@@ -250,6 +251,8 @@ board_cards   — id, kind ('code'|'table'), content (raw markdown block), col (
 | GET | `/api/agent/config` | Live agent LLM config (`base_url`, `model`, `api_key_set`, `overridden`, `defaults`); never returns the key value |
 | PUT | `/api/agent/config` | 🔒 Set runtime LLM `base_url`/`model`/`api_key` (empty string clears an override → env default; omit a field to leave it) |
 | GET | `/api/agent/models` | Proxy the configured endpoint's `/v1/models` (`{available, models[]}`) for the UI dropdown |
+| GET | `/api/agent/reflection-config` | Nightly memory-reflection schedule (`enabled`, `hour`, `minute`, `next_run_time`) |
+| PUT | `/api/agent/reflection-config` | 🔒 Toggle/reschedule the reflection job (`enabled`, `hour` 0-23, `minute` 0-59); reapplies the schedule live |
 | GET | `/api/board` | Investigation board cards (`{cards[]}`) |
 | POST | `/api/board` | Pin a block (`kind` `code`\|`table`, `content`, `source_conv`, `source_title`) → `{card}`; lands in the `todo` column (public, like chat sends) |
 | PATCH | `/api/board/{id}` | Move/reorder a card (`col`, `pos`) — 404 if unknown |
@@ -293,7 +296,7 @@ components/
   HistoryChart.jsx   — 24h sparkline (Recharts) for CPU/GPU/RAM
   LogsModal.jsx      — container log viewer (bottom sheet mobile / centered desktop)
   LoginModal.jsx     — admin login (shown only when a protected action needs auth)
-  AgentConfigModal.jsx — edit the agent's LLM endpoint/model/key at runtime; opened from the global ⚙ button in the App header (not tied to the chat panel). GET /api/agent/config + /api/agent/models public, PUT admin-gated via runProtected. Model field is a datalist fed by /api/agent/models.
+  AgentConfigModal.jsx — "Agent Settings": edit the agent's LLM endpoint/model/key AND toggle/reschedule the nightly memory-reflection job at runtime; opened from the global ⚙ button in the App header (not tied to the chat panel). GET /api/agent/config + /api/agent/models + /api/agent/reflection-config public, PUTs admin-gated via runProtected. Model field is a datalist fed by /api/agent/models; reflection has an enable checkbox + time picker.
   FeedbackModal.jsx  — submit feedback (title + optional description)
   FeedbackPanel.jsx  — read-only display of the feedback queue with statuses
   MemoriesCard.jsx   — browse/add/edit/delete the agent's durable memories (GET public; mutations admin-gated via runProtected)
