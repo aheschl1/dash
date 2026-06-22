@@ -81,6 +81,27 @@ const makeMdComponents = (rawContent, onPin, streaming) => {
   }
 }
 
+// One reasoning ("Thinking") bubble. Collapsed by default; the user opens it to
+// follow along. While it's open and the step is still streaming, the body keeps its
+// scroll pinned to the bottom so the newest tokens stay in view (the body itself
+// scrolls once it passes its max-height). Also re-pins the moment it's opened.
+const ReasoningBubble = memo(function ReasoningBubble({ content, streaming }) {
+  const detailsRef = useRef(null)
+  const bodyRef = useRef(null)
+  const pin = () => {
+    if (detailsRef.current?.open && bodyRef.current) {
+      bodyRef.current.scrollTop = bodyRef.current.scrollHeight
+    }
+  }
+  useEffect(() => { if (streaming) pin() }, [content, streaming])
+  return (
+    <details ref={detailsRef} className="agent-reasoning" onToggle={pin}>
+      <summary>Thinking</summary>
+      <div className="agent-reasoning-body" ref={bodyRef}>{content}</div>
+    </details>
+  )
+})
+
 // One rendered answer bubble. Memoized on (content, streaming) so an unrelated
 // parent re-render (the dashboard polls every few seconds) doesn't rebuild the
 // markdown component map — which, by handing ReactMarkdown a fresh `pre` identity,
@@ -542,10 +563,7 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
           if (m.role === 'tool') return <div key={i} className="agent-tool">→ {m.content}</div>
           if (m.role === 'note') return <div key={i} className="agent-note">{m.content}</div>
           if (m.role === 'reasoning') return (
-            <details key={i} className="agent-reasoning" open={!!m.streaming}>
-              <summary>Thinking</summary>
-              <div className="agent-reasoning-body">{m.content}</div>
-            </details>
+            <ReasoningBubble key={i} content={m.content} streaming={m.streaming} />
           )
           if (m.role === 'approval') return (
             <div key={i} className={`agent-approval agent-approval-${m.status}`}>
