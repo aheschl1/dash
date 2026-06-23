@@ -28,7 +28,10 @@ something lives, the fix for a recurring problem, something the user asked to \
 be remembered). Never save ephemeral state (temperatures, CPU%, uptime, the \
 output of a one-off command) or a duplicate/near-duplicate of an existing \
 memory. Delete a memory only if the conversation shows it is now wrong or \
-obsolete. If nothing qualifies, propose no changes.
+obsolete. There is NO minimum number of memories to produce — most \
+conversations should yield zero. Add a memory ONLY when it carries genuine \
+added value over what is already remembered; never pad the list to hit a quota. \
+If nothing qualifies, propose no changes.
 
 Reply with ONLY a JSON object, no prose, no markdown fences:
 {"add": ["new durable fact", ...], "delete": [id, ...]}

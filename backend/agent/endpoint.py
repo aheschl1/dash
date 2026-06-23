@@ -23,7 +23,7 @@ from fastapi.responses import JSONResponse
 import auth
 import db
 
-from . import store
+from . import store, titler
 from .approval import ApprovalGate
 from .cancel import CancelToken, TurnCanceled
 from .main import continue_conversation
@@ -71,9 +71,16 @@ def _render(messages: list[dict]) -> list[dict]:
             reasoning = (m.get("reasoning") or "").strip()
             if reasoning:
                 turns.append({"role": "reasoning", "content": reasoning})
-            for tc in m.get("tool_calls") or []:
+            tool_calls = m.get("tool_calls") or []
+            # Content alongside tool calls is narration the model emitted before
+            # calling the tool (some models, e.g. Gemma, do this) — surface it as a
+            # muted preamble above the chips, matching the live stream. Content with
+            # no tool calls is the final answer bubble.
+            if content and tool_calls:
+                turns.append({"role": "preamble", "content": m["content"]})
+            for tc in tool_calls:
                 turns.append({"role": "tool", "content": _tool_chip(tc)})
-            if content:
+            if content and not tool_calls:
                 turns.append({"role": "assistant", "content": m["content"]})
     return turns
 
@@ -95,6 +102,7 @@ def send(conv_id: str, message: str = Body(..., embed=True)):
     try:
         answer = continue_conversation(messages, message.strip(), conv_id=conv_id)
         store.save(conv_id, messages)
+        titler.maybe_propose_title(conv_id, messages)
         return {"answer": answer}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -198,6 +206,7 @@ async def _run_turn(turn: "_Turn", messages: list[dict]) -> None:
             turn.gate.request, conv_id, turn.cancel_token,
         )
         await loop.run_in_executor(None, store.save, conv_id, messages)
+        titler.maybe_propose_title(conv_id, messages)
         turn.dispatch({"type": "answer", "conv_id": conv_id, "content": answer})
     except TurnCanceled:
         # Cancelled at a clean boundary: persist the partial turn (it's valid — any

@@ -908,19 +908,23 @@ body.agent-resizing { cursor: col-resize; user-select: none; }
   border-left: 1px solid var(--border);
   display: flex;
   flex-direction: column;
+  /* Clip the conversation sidebar's slide-in so it can't glide across the
+     dashboard to the left of the panel before settling. */
+  overflow: hidden;
 }
-/* Drag handle straddling the panel's left edge to resize it wider/narrower. */
+/* Drag handle pinned to the panel's left edge to resize it wider/narrower. Kept
+   inside the panel (not straddling) so the overflow:hidden clip doesn't eat it. */
 .agent-resize {
   position: absolute;
-  top: 0; bottom: 0; left: -3px;
-  width: 7px;
+  top: 0; bottom: 0; left: 0;
+  width: 6px;
   cursor: col-resize;
   z-index: 1;
 }
 .agent-resize::after {
   content: '';
   position: absolute;
-  top: 0; bottom: 0; left: 3px;
+  top: 0; bottom: 0; left: 0;
   width: 1px;
   background: transparent;
   transition: background 0.12s ease;
@@ -934,7 +938,28 @@ body.agent-resizing .agent-resize::after { background: var(--accent); }
   padding: 12px 14px;
   border-bottom: 1px solid var(--border);
 }
-.agent-title { font-size: 13px; font-weight: 600; letter-spacing: 0.04em; }
+.agent-title {
+  flex: 1;
+  min-width: 0;
+  margin: 0 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+.agent-menu, .agent-newchat {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+}
+.agent-menu { font-size: 16px; }
+.agent-newchat { font-size: 18px; }
+.agent-menu:hover, .agent-newchat:hover { color: var(--accent); }
 .agent-collapse {
   background: none;
   border: none;
@@ -1067,68 +1092,107 @@ body.agent-resizing .agent-resize::after { background: var(--accent); }
 .switch input:checked + .switch-slider::before { transform: translateX(18px); background: #fff; }
 .switch input:focus-visible + .switch-slider { box-shadow: 0 0 0 2px var(--accent); }
 
-.agent-tabs {
-  display: flex;
-  gap: 6px;
-  padding: 8px 10px;
-  overflow-x: auto;
-  scrollbar-width: thin;
-  border-bottom: 1px solid var(--border);
+/* ── Conversation sidebar (slide-in list) ───────────────────────────────── */
+.agent-drawer-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  background: rgba(1, 4, 9, 0.5);
 }
-.agent-tab {
-  flex: 0 0 auto;
+.agent-drawer {
+  position: absolute;
+  top: 0; bottom: 0; left: 0;
+  z-index: 6;
+  width: min(280px, 82%);
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  box-shadow: 2px 0 14px rgba(1, 4, 9, 0.4);
+  animation: agent-drawer-in 0.16s ease;
+}
+@keyframes agent-drawer-in { from { transform: translateX(-100%); } to { transform: none; } }
+.agent-drawer-head {
   display: flex;
   align-items: center;
-  gap: 2px;
-  max-width: 160px;
-  padding: 2px 4px 2px 10px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: var(--surface2);
-  color: var(--text-muted);
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
 }
-.agent-tab.active { color: var(--text); border-color: var(--accent); background: rgba(88, 166, 255, 0.12); }
-.agent-tab-label {
+.agent-drawer-new {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 4px 9px;
+}
+.agent-drawer-new:hover { color: var(--accent); border-color: var(--accent); }
+.agent-drawer-list {
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.agent-drawer-empty { color: var(--text-muted); font-size: 12px; text-align: center; padding: 24px 12px; }
+.agent-conv {
+  display: flex;
+  align-items: center;
+  border-radius: 6px;
+  padding-right: 2px;
+}
+.agent-conv:hover { background: var(--surface2); }
+.agent-conv.active { background: rgba(88, 166, 255, 0.12); }
+.agent-conv-label {
   flex: 1 1 auto;
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: left;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 7px 8px;
+}
+.agent-conv-title {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 12px;
-  background: none;
-  border: none;
-  color: inherit;
-  cursor: pointer;
-  padding: 2px 0;
+  font-size: 13px;
+  color: var(--text-muted);
 }
-.agent-tab-del {
+.agent-conv.active .agent-conv-title { color: var(--text); }
+.agent-conv-meta { font-size: 11px; color: var(--text-muted); opacity: 0.7; }
+.agent-conv-del {
   flex: 0 0 auto;
   background: none;
   border: none;
   color: var(--text-muted);
   cursor: pointer;
-  font-size: 15px;
-  line-height: 1;
-  padding: 0 4px;
-  border-radius: 50%;
-}
-.agent-tab-del:hover { color: var(--red); }
-.agent-tab-new {
-  flex: 0 0 auto;
   font-size: 16px;
   line-height: 1;
-  width: 28px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: var(--surface2);
-  color: var(--text-muted);
-  cursor: pointer;
+  padding: 0 6px;
+  border-radius: 4px;
+  opacity: 0;
+  transition: opacity 0.12s;
 }
-.agent-tab-new:hover { color: var(--accent); border-color: var(--accent); }
+.agent-conv:hover .agent-conv-del,
+.agent-conv.active .agent-conv-del { opacity: 1; }
+.agent-conv-del:hover { color: var(--red); }
 
 .agent-messages {
   flex: 1;
   overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
   padding: 12px;
   display: flex;
   flex-direction: column;
@@ -1603,8 +1667,17 @@ button.board-card-src-link:hover { color: var(--accent); text-decoration: underl
   }
   .agent-rail .agent-rail-text { writing-mode: horizontal-tb; transform: none; }
 
-  .agent-panel { width: 100%; max-width: none; }
+  .agent-panel { width: 100%; max-width: none; overscroll-behavior: none; }
   .agent-resize { display: none; }
+
+  /* The panel goes full-screen on mobile, so the bottom-left Investigation pill
+     would float over the chat's input area — hide it while the panel is open. */
+  .app.agent-open .board-rail { display: none; }
+
+  /* The full-screen panel covers the viewport, but a swipe on its non-scrolling
+     areas still drags the document behind it — lock the page while it's open.
+     (Desktop keeps page scroll since the panel only docks alongside the grid.) */
+  body.agent-panel-open { overflow: hidden; }
 }
 
 /* Scheduled jobs + reflection log card */

@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_chat_sessions_updated ON chat_sessions(updated_at);
 ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS reflected_at BIGINT;
+ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS auto_title TEXT;
 CREATE TABLE IF NOT EXISTS agent_memories (
     id         SERIAL PRIMARY KEY,
     content    TEXT NOT NULL,
@@ -343,10 +344,33 @@ def chat_get(id: str) -> list[dict] | None:
 def chat_list(limit: int = 100) -> list[dict]:
     with psycopg.connect(DSN) as con:
         rows = con.execute(
-            "SELECT id, title, turns FROM chat_sessions ORDER BY updated_at DESC LIMIT %s",
+            "SELECT id, COALESCE(NULLIF(auto_title,''), title) AS title, turns "
+            "FROM chat_sessions ORDER BY updated_at DESC LIMIT %s",
             (limit,),
         ).fetchall()
     return [{"id": r[0], "title": r[1], "turns": r[2]} for r in rows]
+
+
+def chat_has_auto_title(id: str) -> bool:
+    """Whether the LLM titling sidecar has already named this conversation."""
+    with psycopg.connect(DSN) as con:
+        row = con.execute(
+            "SELECT 1 FROM chat_sessions WHERE id=%s AND COALESCE(auto_title,'') <> ''",
+            (id,),
+        ).fetchone()
+    return row is not None
+
+
+def chat_set_auto_title(id: str, title: str) -> None:
+    """Persist an LLM-proposed title without touching messages/updated_at.
+
+    Kept separate from chat_save (which recomputes the first-message-derived
+    `title` every turn) so the proposed name sticks; chat_list prefers it."""
+    with psycopg.connect(DSN) as con:
+        con.execute(
+            "UPDATE chat_sessions SET auto_title=%s WHERE id=%s", (title, id)
+        )
+        con.commit()
 
 
 def chat_unreflected(limit: int) -> list[str]:

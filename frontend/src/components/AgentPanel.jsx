@@ -127,6 +127,8 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
   const [activeId, setActiveId] = useState(null)
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
+  // The conversation sidebar (slide-in list) — replaces the old horizontal tabs.
+  const [listOpen, setListOpen] = useState(false)
   // Text the user highlighted on the dashboard and chose to "ask about"; shown as
   // a chip above the input and folded into the next send (see send()).
   const [context, setContext] = useState(null)
@@ -147,6 +149,10 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
 
   // The WS onmessage closure reads the live active id without rebinding.
   useEffect(() => { activeIdRef.current = activeId }, [activeId])
+
+  // Collapsing the panel keeps the component mounted, so drop the sidebar too —
+  // otherwise it'd still be open the next time the panel is expanded.
+  useEffect(() => { if (!open) setListOpen(false) }, [open])
 
   const loadConversations = useCallback(async () => {
     try {
@@ -209,6 +215,16 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
     } catch {}
   }, [])
 
+  // The panel is a full-screen fixed overlay on mobile; lock the underlying
+  // document so swipes on its non-scrolling areas (header, tabs, composer) don't
+  // scroll the dashboard behind it. The nested .agent-messages keeps its own
+  // scroll (overscroll-behavior: contain stops it chaining out).
+  useEffect(() => {
+    if (!open) return
+    document.body.classList.add('agent-panel-open')
+    return () => document.body.classList.remove('agent-panel-open')
+  }, [open])
+
   // First expand: adopt existing conversations, or start one if there are none.
   useEffect(() => {
     if (!open) return
@@ -240,8 +256,13 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
     clearPendingContext()
   }, [pendingContext, clearPendingContext])
 
+  // Auto-scroll to the newest tokens, but only if the user is already near the
+  // bottom — otherwise we'd yank them back down while they scroll up to read.
   useEffect(() => {
-    if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight
+    const el = scrollRef.current
+    if (!el) return
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+    if (nearBottom) el.scrollTop = el.scrollHeight
   }, [messages, sending])
 
   // Drive both the panel width and the .app right-padding off one CSS var on :root.
@@ -311,10 +332,18 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
   const handleEvent = useCallback(async (ev) => {
     if (ev.conv_id && ev.conv_id !== activeIdRef.current) return
     if (ev.type === 'tool_call') {
-      // A tool call ended the step: drop any streamed preamble (the persisted
-      // render never shows assistant content that accompanies tool calls), then
-      // add the chip.
-      setMessages(m => [...m.filter(x => !(x.role === 'assistant' && x.streaming)), { role: 'tool', content: toolChipText(ev) }])
+      // A tool call ended the step: any streamed assistant text is narration the
+      // model emitted before calling the tool (some models, e.g. Gemma, do this).
+      // Keep it as a `preamble` above the chip (rendered like a full answer) rather
+      // than dropping it — the backend `_render` surfaces the same preamble on reload.
+      setMessages(m => [
+        ...m
+          .map(x => (x.role === 'assistant' && x.streaming)
+            ? { role: 'preamble', content: x.content }
+            : x)
+          .filter(x => !(x.role === 'preamble' && !x.content.trim())),
+        { role: 'tool', content: toolChipText(ev) },
+      ])
     } else if (ev.type === 'answer_delta') {
       setMessages(m => appendDelta(m, 'assistant', ev.content))
     } else if (ev.type === 'reasoning_delta') {
@@ -369,6 +398,10 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
       pendingConvRef.current = null
       if (resumedRef.current.delete(ev.conv_id)) loadMessages(ev.conv_id)
       loadConversations()
+      // The titling sidecar names a conversation asynchronously after the turn
+      // finishes (non-blocking), so the new title isn't ready at `done`. Refresh
+      // once more shortly after to pick it up.
+      setTimeout(loadConversations, 4000)
     }
   }, [fetchRendered, loadMessages, loadConversations])
 
@@ -517,6 +550,9 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
     )
   }
 
+  const activeTitle =
+    conversations.find(c => c.id === activeId)?.title || (activeId ? 'New chat' : 'Assistant')
+
   return (
     <aside className="agent-panel">
       <div
@@ -528,32 +564,60 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
         aria-orientation="vertical"
       />
       <div className="agent-head">
-        <span className="agent-title">Assistant</span>
+        <button
+          className="agent-menu"
+          onClick={() => setListOpen(v => !v)}
+          title="Conversations"
+          aria-label="Conversations"
+          aria-expanded={listOpen}
+        >☰</button>
+        <span className="agent-title" title={activeTitle}>{activeTitle}</span>
+        <button
+          className="agent-newchat"
+          onClick={() => { newConversation(); setListOpen(false) }}
+          title="New conversation"
+          aria-label="New conversation"
+        >＋</button>
         <button className="agent-collapse" onClick={() => setOpen(false)} title="Collapse" aria-label="Collapse">›</button>
       </div>
 
-      <div className="agent-tabs">
-        {conversations.map(c => (
-          <div key={c.id} className={`agent-tab${c.id === activeId ? ' active' : ''}`}>
-            <button
-              className="agent-tab-label"
-              onClick={() => selectConversation(c.id)}
-              title={c.title || 'New chat'}
-            >
-              {c.title || 'New chat'}
-            </button>
-            <button
-              className="agent-tab-del"
-              onClick={() => deleteConversation(c.id)}
-              title="Delete conversation"
-              aria-label="Delete conversation"
-            >
-              ×
-            </button>
+      {listOpen && (
+        <>
+          <div className="agent-drawer-backdrop" onClick={() => setListOpen(false)} />
+          <div className="agent-drawer" role="dialog" aria-label="Conversations">
+            <div className="agent-drawer-head">
+              <span>Conversations</span>
+              <button
+                className="agent-drawer-new"
+                onClick={() => { newConversation(); setListOpen(false) }}
+              >＋ New</button>
+            </div>
+            <div className="agent-drawer-list">
+              {conversations.length === 0 && (
+                <div className="agent-drawer-empty">No conversations yet</div>
+              )}
+              {conversations.map(c => (
+                <div key={c.id} className={`agent-conv${c.id === activeId ? ' active' : ''}`}>
+                  <button
+                    className="agent-conv-label"
+                    onClick={() => { selectConversation(c.id); setListOpen(false) }}
+                    title={c.title || 'New chat'}
+                  >
+                    <span className="agent-conv-title">{c.title || 'New chat'}</span>
+                    <span className="agent-conv-meta">{c.turns || 0} turn{c.turns === 1 ? '' : 's'}</span>
+                  </button>
+                  <button
+                    className="agent-conv-del"
+                    onClick={() => deleteConversation(c.id)}
+                    title="Delete conversation"
+                    aria-label="Delete conversation"
+                  >×</button>
+                </div>
+              ))}
+            </div>
           </div>
-        ))}
-        <button className="agent-tab-new" onClick={newConversation} title="New conversation" aria-label="New conversation">＋</button>
-      </div>
+        </>
+      )}
 
       <div className="agent-messages" ref={scrollRef}>
         {messages.length === 0 && !sending && (
@@ -562,6 +626,12 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
         {messages.map((m, i) => {
           if (m.role === 'tool') return <div key={i} className="agent-tool">→ {m.content}</div>
           if (m.role === 'note') return <div key={i} className="agent-note">{m.content}</div>
+          // Narration the model emitted before a tool call. Rendered identically to
+          // a final answer (full markdown, pins, Mermaid) — models sometimes put
+          // important content here.
+          if (m.role === 'preamble') return (
+            <AssistantBubble key={i} content={m.content} streaming={false} onPin={pinBlock} />
+          )
           if (m.role === 'reasoning') return (
             <ReasoningBubble key={i} content={m.content} streaming={m.streaming} />
           )
