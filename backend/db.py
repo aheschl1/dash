@@ -105,13 +105,11 @@ INSERT INTO boards (title, description, created_at, updated_at)
 UPDATE board_cards SET board_id = (SELECT MIN(id) FROM boards) WHERE board_id IS NULL;
 CREATE INDEX IF NOT EXISTS idx_board_cards_board ON board_cards(board_id, col, pos);
 ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS board_id INTEGER;
-CREATE TABLE IF NOT EXISTS conversation_notes (
-    id         SERIAL PRIMARY KEY,
-    conv_id    TEXT NOT NULL,
-    content    TEXT NOT NULL,
-    created_at BIGINT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_conversation_notes_conv ON conversation_notes(conv_id);
+-- Whether the USER scoped this conversation by hand (via the dashboard) vs the
+-- agent scoping itself with its own tool; only the manual case is surfaced in
+-- the agent's system prompt (it already knows about scopes it set itself).
+ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS board_manual BOOLEAN NOT NULL DEFAULT FALSE;
+DROP TABLE IF EXISTS conversation_notes;
 CREATE TABLE IF NOT EXISTS reflection_runs (
     id            SERIAL PRIMARY KEY,
     started_at    BIGINT NOT NULL,
@@ -332,21 +330,11 @@ def chat_save(id: str, messages: list[dict]) -> None:
             "updated_at=EXCLUDED.updated_at",
             (id, _chat_title(messages), _chat_turns(messages), payload, now, now),
         )
-        pruned = con.execute(
+        con.execute(
             "DELETE FROM chat_sessions WHERE id NOT IN "
-            "(SELECT id FROM chat_sessions ORDER BY updated_at DESC LIMIT %s) "
-            "RETURNING id",
+            "(SELECT id FROM chat_sessions ORDER BY updated_at DESC LIMIT %s)",
             (CHAT_SESSIONS_MAX,),
-        ).fetchall()
-        if pruned:
-            # Conversation notes are scoped to a chat; drop them with it. Safe to
-            # key off the pruned ids (not "all ids missing from chat_sessions")
-            # because a brand-new conversation may hold notes before its first
-            # chat_save row exists, and we must not delete those.
-            con.execute(
-                "DELETE FROM conversation_notes WHERE conv_id = ANY(%s)",
-                ([r[0] for r in pruned],),
-            )
+        )
         con.commit()
 
 
@@ -368,20 +356,23 @@ def chat_list(limit: int = 100) -> list[dict]:
     return [{"id": r[0], "title": r[1], "turns": r[2], "board_id": r[3]} for r in rows]
 
 
-def chat_set_board(id: str, board_id: int | None) -> None:
+def chat_set_board(id: str, board_id: int | None, manual: bool = False) -> None:
     """Scope a conversation to an investigation (None to unscope).
 
-    Upserts so scoping works even before the conversation's row is lazily created
-    on its first saved turn (a new chat, or the agent auto-scoping mid first turn).
-    chat_save's ON CONFLICT update never touches board_id, so the scope survives
-    every subsequent turn."""
+    `manual` records whether a human set the scope from the dashboard (vs the
+    agent scoping itself with its own tool) — see chat_get_scope. Unscoping clears
+    the flag too. Upserts so scoping works even before the conversation's row is
+    lazily created on its first saved turn (a new chat, or the agent auto-scoping
+    mid first turn). chat_save's ON CONFLICT update never touches board_id, so the
+    scope survives every subsequent turn."""
     now = int(datetime.now(timezone.utc).timestamp())
+    manual = bool(manual) and board_id is not None
     with psycopg.connect(DSN) as con:
         con.execute(
-            "INSERT INTO chat_sessions (id, title, turns, messages, created_at, updated_at, board_id) "
-            "VALUES (%s,'',0,'[]'::jsonb,%s,%s,%s) "
-            "ON CONFLICT (id) DO UPDATE SET board_id=EXCLUDED.board_id",
-            (id, now, now, board_id),
+            "INSERT INTO chat_sessions (id, title, turns, messages, created_at, updated_at, board_id, board_manual) "
+            "VALUES (%s,'',0,'[]'::jsonb,%s,%s,%s,%s) "
+            "ON CONFLICT (id) DO UPDATE SET board_id=EXCLUDED.board_id, board_manual=EXCLUDED.board_manual",
+            (id, now, now, board_id, manual),
         )
         con.commit()
 
@@ -392,6 +383,22 @@ def chat_get_board(id: str) -> int | None:
             "SELECT board_id FROM chat_sessions WHERE id=%s", (id,)
         ).fetchone()
     return row[0] if row else None
+
+
+def chat_get_scope(id: str) -> dict | None:
+    """The conversation's investigation scope: its board_id, whether the USER set
+    it manually (vs the agent's own scope tool), and the board's title. None when
+    the conversation row doesn't exist; board_id is None when unscoped."""
+    with psycopg.connect(DSN) as con:
+        row = con.execute(
+            "SELECT c.board_id, c.board_manual, b.title "
+            "FROM chat_sessions c LEFT JOIN boards b ON b.id = c.board_id "
+            "WHERE c.id=%s",
+            (id,),
+        ).fetchone()
+    if not row:
+        return None
+    return {"board_id": row[0], "manual": row[1], "title": row[2]}
 
 
 def chat_has_auto_title(id: str) -> bool:
@@ -444,7 +451,6 @@ def chat_mark_reflected(id: str) -> None:
 def chat_delete(id: str) -> bool:
     with psycopg.connect(DSN) as con:
         n = con.execute("DELETE FROM chat_sessions WHERE id=%s", (id,)).rowcount
-        con.execute("DELETE FROM conversation_notes WHERE conv_id=%s", (id,))
         con.commit()
     return n > 0
 
@@ -680,33 +686,6 @@ def reflection_run_list(limit: int = 20) -> list[dict]:
          "added": r[4], "deleted": r[5], "errors": r[6]}
         for r in rows
     ]
-
-
-# ── Conversation notes ──────────────────────────────────────────────────────────
-# Like memories, but scoped to a single conversation and injected fresh per run
-# (never baked into the persisted system prompt) so they stay current across turns
-# and reloads. Removed with the conversation (see chat_delete / chat_save prune).
-
-
-def conv_note_save(conv_id: str, content: str) -> int:
-    now = int(datetime.now(timezone.utc).timestamp())
-    with psycopg.connect(DSN) as con:
-        row = con.execute(
-            "INSERT INTO conversation_notes (conv_id, content, created_at) "
-            "VALUES (%s,%s,%s) RETURNING id",
-            (conv_id, content, now),
-        ).fetchone()
-        con.commit()
-    return row[0]
-
-
-def conv_note_list(conv_id: str) -> list[dict]:
-    with psycopg.connect(DSN) as con:
-        rows = con.execute(
-            "SELECT id, content FROM conversation_notes WHERE conv_id=%s ORDER BY id",
-            (conv_id,),
-        ).fetchall()
-    return [{"id": r[0], "content": r[1]} for r in rows]
 
 
 def query_history(minutes: int = 1440) -> list[dict]:

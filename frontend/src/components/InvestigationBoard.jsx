@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import Mermaid, { mermaidSource } from './Mermaid'
@@ -21,6 +21,9 @@ const COLS = [
 ]
 
 const COLLAPSE_KEY = 'board-collapsed-cols'
+// Pick up pins/moves/new boards made elsewhere (the agent, another VPN peer)
+// without reopening the panel — mirrors the rest of the dashboard's polling.
+const BOARD_POLL_MS = 3000
 
 export default function InvestigationBoard({ open, onClose, refreshKey, runProtected, activeBoardId, setActiveBoardId, onOpenConversation }) {
   const [boards, setBoards] = useState([])
@@ -100,6 +103,21 @@ export default function InvestigationBoard({ open, onClose, refreshKey, runProte
       try { localStorage.setItem(ACTIVE_KEY, String(activeBoardId)) } catch { /* ignore */ }
     }
   }, [activeBoardId])
+
+  // Live-ish updates: poll the investigation list + active board's cards while the
+  // overlay is open, so pins/moves/new boards from the agent or another peer show up.
+  // Held off mid-drag so an in-flight reorder isn't clobbered by an inbound refetch.
+  const dragRef = useRef(null)
+  dragRef.current = dragId
+  useEffect(() => {
+    if (!open) return
+    const t = setInterval(() => {
+      if (dragRef.current != null) return
+      loadBoards()
+      load()
+    }, BOARD_POLL_MS)
+    return () => clearInterval(t)
+  }, [open, loadBoards, load])
 
   const activeBoard = boards.find((b) => b.id === activeBoardId) || null
 

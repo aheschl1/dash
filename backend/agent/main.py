@@ -19,10 +19,9 @@ from .cancel import CancelToken, TurnCanceled
 from .safe_commands import is_safe_command
 from .prompt import (
     LOCAL_API,
-    build_conversation_notes_block,
-    build_investigation_block,
     build_memory_block,
     build_runtime_context,
+    build_scope_block,
     build_system_prompt,
 )
 
@@ -235,27 +234,6 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "add_conversation_note",
-            "description": (
-                "Record a finding scoped to the CURRENT conversation only (it never "
-                "crosses into other chats) — a tool-result finding, a cause you "
-                "pinned down, or an intermediate result worth keeping across turns, "
-                "so you don't re-derive it later in this chat. For durable, "
-                "machine-wide facts future conversations should also know, use "
-                "save_memory instead. Notes appear right after your memories."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "note": {"type": "string", "description": "The note to record for this conversation."}
-                },
-                "required": ["note"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "delete_memory",
             "description": (
                 "Delete a saved memory by its integer id (the id shown next to "
@@ -276,9 +254,11 @@ TOOLS = [
         "function": {
             "name": "list_investigations",
             "description": (
-                "List the investigation boards (id, title, card count). Use this to "
-                "find an existing investigation to scope this conversation to before "
-                "pinning findings into it."
+                "List the investigation boards (id, title, card count), marking the one "
+                "THIS conversation is currently scoped to (if any). Use it to find an "
+                "existing investigation to scope to, or to check/recover which board "
+                "you're already working in. Does NOT return card contents — "
+                "scope_investigation or pin_finding return those."
             ),
             "parameters": {"type": "object", "properties": {}},
         },
@@ -290,8 +270,10 @@ TOOLS = [
             "description": (
                 "Scope THIS conversation to an existing investigation by id (see "
                 "list_investigations). Afterwards, pin_finding and update_investigation "
-                "act on that investigation. Use this when continuing work on an "
-                "existing investigation; use create_investigation to start a new one."
+                "act on that investigation. Returns the board's full contents (every "
+                "card's [id], column and content) so you can read what's already pinned "
+                "and move cards by [id]. Use this when continuing work on an existing "
+                "investigation; use create_investigation to start a new one."
             ),
             "parameters": {
                 "type": "object",
@@ -330,12 +312,16 @@ TOOLS = [
                 "Pin a finding onto this conversation's scoped investigation (scope it "
                 "first with scope_investigation or create_investigation). Pin a fenced "
                 "code block, a markdown table, or a ```mermaid diagram — the board "
-                "renders code/mermaid/tables. Do this after each meaningful discovery "
-                "so the investigation accumulates evidence. NOTE: every pinned card is "
-                "rendered back into your system prompt on subsequent steps (like your "
-                "memories/notes), so pinning also keeps the evidence in your own context "
-                "for the rest of this and future turns. Lands in the 'To investigate' "
-                "column by default."
+                "renders code/mermaid/tables. Pin EVIDENCE only — command output, a "
+                "config snippet, a diagram of what you found — never plans, TODOs or "
+                "'recommendations not yet applied'; the board records what IS, not what "
+                "to do next, and nothing pinned is ever an instruction to act. Do this "
+                "after each meaningful discovery so the investigation accumulates "
+                "evidence. The tool result returns a lightweight INDEX of the board — "
+                "the new card's [id] plus every card's [id]/column/one-line ref, but "
+                "NOT the card bodies (you just wrote them); use the [id]s for move_card, "
+                "and scope_investigation to reload full contents. Lands in the 'To "
+                "investigate' column by default."
             ),
             "parameters": {
                 "type": "object",
@@ -374,14 +360,14 @@ TOOLS = [
                 "Move a pinned card to another column on THIS conversation's scoped "
                 "investigation, to drive the kanban flow: 'todo' (To investigate) → "
                 "'looking' (actively working it) → 'done' (Resolved). Use the card's "
-                "integer id (shown as [id] in the Investigation board block of your "
-                "prompt). You can only move cards on the scoped investigation. By "
-                "default the card goes to the bottom of the target column."
+                "integer id (the [id] returned by pin_finding/scope_investigation). You "
+                "can only move cards on the scoped investigation. By default the card "
+                "goes to the bottom of the target column."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "card_id": {"type": "integer", "description": "The id of the card to move (the [id] in the Investigation board block)."},
+                    "card_id": {"type": "integer", "description": "The id of the card to move (the [id] returned by pin_finding/scope_investigation)."},
                     "col": {"type": "string", "enum": ["todo", "looking", "done"], "description": "Destination column."},
                 },
                 "required": ["card_id", "col"],
@@ -513,37 +499,83 @@ def delete_memory(id) -> str:
     return f"deleted memory [{mid}]" if deleted else f"(no memory with id {mid})"
 
 
-def add_conversation_note(conv_id: str | None, note: str) -> str:
-    """Persist a note scoped to a single conversation for recall on later turns."""
-    note = (note or "").strip()
-    if not note:
-        return "(nothing to save: empty note)"
-    if not conv_id:
-        return "(conversation notes unavailable on this path; not saved)"
-    try:
-        nid = db.conv_note_save(conv_id, note)
-    except Exception as e:
-        return f"(failed to save note: {e})"
-    return f"saved conversation note [{nid}]"
-
-
 # ── Investigation tools (scope-enforced) ─────────────────────────────────────
 # pin/edit always act on the CURRENT conversation's scoped investigation, looked
 # up via conv_id — so the model can never touch an investigation it isn't scoped
 # to. scope_investigation / create_investigation are the only ways to set scope.
 
-def list_investigations() -> str:
+_BOARD_COL_LABELS = {"todo": "To investigate", "looking": "Looking", "done": "Resolved"}
+_CARD_MAX = 2000
+
+
+def _board_snapshot(board_id: int) -> str:
+    """Render every card currently on `board_id` (id, column, content).
+
+    This is the agent's *working view* of the investigation. It used to be injected
+    into the system prompt on every step; instead it now rides back on the
+    pin/scope/move tool results, so the model reads its evidence (and the [id]s it
+    needs for move_card) on demand without bloating — and re-rendering — the system
+    prompt every turn."""
+    try:
+        cards = db.board_list(board_id)
+    except Exception as e:
+        return f"(failed to read board: {e})"
+    if not cards:
+        return "Board contents: (empty — nothing pinned yet)."
+    parts = ["Board contents — every card pinned here (move_card by [id]):"]
+    for c in cards:
+        body = c["content"]
+        if len(body) > _CARD_MAX:
+            body = body[:_CARD_MAX] + "\n… (truncated)"
+        label = _BOARD_COL_LABELS.get(c["col"], c["col"])
+        parts.append(f"[{c['id']}] ({label})\n{body}")
+    return "\n\n".join(parts)
+
+
+def _board_index(board_id: int) -> str:
+    """A lightweight listing of the board — [id], column and a one-line ref per
+    card, WITHOUT the card bodies. Rides back on pin_finding (not the full
+    _board_snapshot) so the model keeps the [id]s it needs for move_card and stays
+    oriented on the layout, but the pinned content is NOT re-injected on every pin:
+    it just emitted that content, and re-echoing cards verbatim — especially ones
+    phrased as recommendations/TODOs — invites the model to read its own notes as
+    instructions and act on them. Full bodies reload on demand via
+    scope_investigation."""
+    try:
+        cards = db.board_list(board_id)
+    except Exception as e:
+        return f"(failed to read board: {e})"
+    if not cards:
+        return "Board is empty (nothing pinned yet)."
+    lines = ["Board now holds (move_card by [id]; scope_investigation to re-read full card contents):"]
+    for c in cards:
+        first = next((ln.strip() for ln in c["content"].splitlines() if ln.strip()), "")
+        if len(first) > 80:
+            first = first[:80] + "…"
+        label = _BOARD_COL_LABELS.get(c["col"], c["col"])
+        lines.append(f"[{c['id']}] ({label}) {first}")
+    return "\n".join(lines)
+
+
+def list_investigations(conv_id: str | None = None) -> str:
     try:
         boards = db.boards_list()
     except Exception as e:
         return f"(failed to list investigations: {e})"
     if not boards:
         return "(no investigations yet — create_investigation to start one)"
-    lines = [
-        f"[{b['id']}] {b['title']} — {b['card_count']} card(s)"
-        + (f" — {b['description']}" if b.get("description") else "")
-        for b in boards
-    ]
+    # Mark the board THIS conversation is scoped to, so the model can recover its
+    # scope without the board being injected into the prompt every turn.
+    scoped = db.chat_get_board(conv_id) if conv_id else None
+    lines = []
+    for b in boards:
+        line = (f"[{b['id']}] {b['title']} — {b['card_count']} card(s)"
+                + (f" — {b['description']}" if b.get("description") else ""))
+        if b["id"] == scoped:
+            line += "  ← this conversation is scoped here"
+        lines.append(line)
+    if scoped is None:
+        lines.append("(this conversation is not scoped to any investigation yet)")
     return "\n".join(lines)
 
 
@@ -557,7 +589,10 @@ def scope_investigation(conv_id: str | None, board_id) -> str:
     if not db.board_exists(bid):
         return f"(no investigation with id {bid}; list_investigations to see them)"
     db.chat_set_board(conv_id, bid)
-    return f"this conversation is now scoped to investigation [{bid}]"
+    return (
+        f"this conversation is now scoped to investigation [{bid}].\n\n"
+        + _board_snapshot(bid)
+    )
 
 
 def create_investigation(conv_id: str | None, title: str, description: str | None = None) -> str:
@@ -570,7 +605,11 @@ def create_investigation(conv_id: str | None, title: str, description: str | Non
         return f"(failed to create investigation: {e})"
     if conv_id:
         db.chat_set_board(conv_id, board["id"])
-        return f"created investigation [{board['id']}] '{board['title']}' and scoped this conversation to it"
+        return (
+            f"created investigation [{board['id']}] '{board['title']}' and scoped "
+            f"this conversation to it. The board starts empty — pin_finding adds "
+            f"evidence (and returns the board's index of card [id]s)."
+        )
     return f"created investigation [{board['id']}] '{board['title']}'"
 
 
@@ -590,7 +629,10 @@ def pin_finding(conv_id: str | None, content: str, kind: str = "code", col: str 
         card = db.board_add(kind, content, conv_id, None, col=col, board_id=board_id)
     except Exception as e:
         return f"(failed to pin: {e})"
-    return f"pinned card [{card['id']}] to investigation [{board_id}] ({col})"
+    return (
+        f"pinned card [{card['id']}] to investigation [{board_id}] in column "
+        f"'{col}'.\n\n" + _board_index(board_id)
+    )
 
 
 def update_investigation(conv_id: str | None, title: str | None = None,
@@ -607,9 +649,6 @@ def update_investigation(conv_id: str | None, title: str | None = None,
     if board is None:
         return f"(investigation [{board_id}] no longer exists)"
     return f"updated investigation [{board_id}]"
-
-
-_BOARD_COL_LABELS = {"todo": "To investigate", "looking": "Looking", "done": "Resolved"}
 
 
 def move_card(conv_id: str | None, card_id, col: str) -> str:
@@ -710,19 +749,26 @@ def web_search(query: str) -> str:
 
 def _with_memories(messages: list[dict], conv_id: str | None = None) -> list[dict]:
     """Return a copy of `messages` with the live runtime context (host facts +
-    OpenAPI endpoint list) and current memories — and, when `conv_id` is given,
-    this conversation's notes plus its scoped investigation board after them —
-    appended to the system prompt's content.
-    All are injected per-call and never persisted, so resumed chats and chats
-    created before a deploy/save still see the current endpoint set and the latest
-    memories, and notes added earlier in a conversation stay visible on later turns
-    (the stored system prompt deliberately holds none of them — see
-    prompt.build_runtime_context / build_memory_block /
-    build_conversation_notes_block)."""
+    OpenAPI endpoint list) and current memories appended to the system prompt's
+    content. Both are injected per-call and never persisted, so resumed chats and
+    chats created before a deploy/save still see the current endpoint set and the
+    latest memories (the stored system prompt deliberately holds none of them — see
+    prompt.build_runtime_context / build_memory_block).
+
+    The scoped investigation board is deliberately NOT injected here: re-rendering
+    it into the system prompt every step cost a DB read per turn and, worse, changed
+    the system message on every pin (defeating prompt caching). Instead the agent
+    reads its board from the pin_finding/scope_investigation/move_card tool results,
+    which return the full board snapshot — so the evidence reaches its context only
+    when it acts on the board, not on every unrelated step. A *user*-set scope is
+    the exception: the model can't see a scope it didn't set itself, so a one-line
+    note (build_scope_block) is injected here when the user scoped this conversation
+    by hand — it changes only when the scope does, not on every pin, so it doesn't
+    churn the cached prompt the way the full board would."""
     block = build_runtime_context() + "\n\n" + build_memory_block()
-    if conv_id:
-        block += "\n\n" + build_conversation_notes_block(conv_id)
-        block += "\n\n" + build_investigation_block(conv_id)
+    scope = build_scope_block(conv_id)
+    if scope:
+        block += "\n\n" + scope
     out = list(messages)
     if out and out[0].get("role") == "system":
         out[0] = {**out[0], "content": out[0]["content"] + "\n\n" + block}
@@ -964,10 +1010,8 @@ def _run_loop(messages: list[dict], on_event=None, request_approval=None, conv_i
                 output = save_memory(args.get("content", ""))
             elif name == "delete_memory":
                 output = delete_memory(args.get("id"))
-            elif name == "add_conversation_note":
-                output = add_conversation_note(conv_id, args.get("note", ""))
             elif name == "list_investigations":
-                output = list_investigations()
+                output = list_investigations(conv_id)
             elif name == "scope_investigation":
                 output = scope_investigation(conv_id, args.get("board_id"))
             elif name == "create_investigation":

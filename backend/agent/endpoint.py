@@ -134,7 +134,7 @@ def scope_conversation(conv_id: str, board_id: int | None = Body(None, embed=Tru
         return JSONResponse(status_code=404, content={"error": "unknown conversation"})
     if board_id is not None and not db.board_exists(board_id):
         return JSONResponse(status_code=404, content={"error": "unknown investigation"})
-    db.chat_set_board(conv_id, board_id)
+    db.chat_set_board(conv_id, board_id, manual=True)
     return {"id": conv_id, "board_id": board_id}
 
 
