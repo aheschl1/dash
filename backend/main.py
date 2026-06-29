@@ -16,6 +16,7 @@ from db import (init_db, insert_snapshot, query_history, insert_event, query_eve
                get_auth_secret, get_user, set_password,
                memory_list, memory_save, memory_update, memory_delete,
                board_list, board_add, board_move, board_delete,
+               boards_list, board_create, board_update, board_delete_investigation,
                reflection_run_list)
 from collectors import system, gpu, temps, containers, ports, wireguard, disk, processes, network, connections
 from collectors import events as events_collector, smart, alerts, sessions, hardware, vms, cron, directory, vpn
@@ -496,13 +497,53 @@ def list_agent_models():
         return {"available": False, "models": [], "error": str(e)}
 
 
-# ── Investigation board ───────────────────────────────────────────────────────
-# Public, like chat sends — pinning is part of the agent workflow, not server config.
+# ── Investigations (boards) ───────────────────────────────────────────────────
+# Public, like chat sends — investigations are part of the agent workflow, not
+# server config. Only DELETE of a whole investigation is admin-gated (it cascades
+# all of its cards).
+
+
+@app.get("/api/boards")
+def list_boards():
+    return {"boards": boards_list()}
+
+
+@app.post("/api/boards")
+def create_board(
+    title: str = Body(..., embed=True),
+    description: str | None = Body(None, embed=True),
+):
+    title = (title or "").strip()
+    if not title:
+        return JSONResponse(status_code=400, content={"error": "title required"})
+    return {"board": board_create(title, description)}
+
+
+@app.patch("/api/boards/{id}")
+def edit_board(
+    id: int,
+    title: str | None = Body(None, embed=True),
+    description: str | None = Body(None, embed=True),
+):
+    board = board_update(id, title=title, description=description)
+    if board is None:
+        return JSONResponse(status_code=404, content={"error": "unknown investigation"})
+    return {"board": board}
+
+
+@app.delete("/api/boards/{id}")
+def remove_board(id: int, user: dict = Depends(require_admin)):
+    if not board_delete_investigation(id):
+        return JSONResponse(status_code=404, content={"error": "unknown investigation"})
+    return {"deleted": id}
+
+
+# ── Investigation cards ───────────────────────────────────────────────────────
 
 
 @app.get("/api/board")
-def get_board():
-    return {"cards": board_list()}
+def get_board(board_id: int | None = Query(None)):
+    return {"cards": board_list(board_id)}
 
 
 @app.post("/api/board")
@@ -511,11 +552,12 @@ def add_board_card(
     content: str = Body(...),
     source_conv: str | None = Body(None),
     source_title: str | None = Body(None),
+    board_id: int | None = Body(None),
 ):
     content = content.strip()
     if kind not in ("code", "table") or not content:
         return JSONResponse(status_code=400, content={"error": "kind and content required"})
-    card = board_add(kind, content, source_conv, source_title)
+    card = board_add(kind, content, source_conv, source_title, board_id=board_id)
     return {"card": card}
 
 
@@ -524,8 +566,9 @@ def move_board_card(
     id: int,
     col: str = Body(..., embed=True),
     pos: float = Body(..., embed=True),
+    board_id: int | None = Body(None, embed=True),
 ):
-    if not board_move(id, col, pos):
+    if not board_move(id, col, pos, board_id=board_id):
         return JSONResponse(status_code=404, content={"error": "unknown card"})
     return {"id": id, "col": col, "pos": pos}
 

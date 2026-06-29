@@ -122,8 +122,9 @@ const AssistantBubble = memo(function AssistantBubble({ content, streaming, onPi
 // dashboard left (via padding on .app). The top row lists past conversations
 // (persisted in Postgres); each is a standard chat. Chats survive reloads and
 // restarts — they're removed only by the explicit delete (×) button.
-export default function AgentPanel({ open, setOpen, runProtected, pendingContext, clearPendingContext, openConvId, clearOpenConv, onPinned }) {
+export default function AgentPanel({ open, setOpen, runProtected, pendingContext, clearPendingContext, openConvId, clearOpenConv, fallbackBoardId, onScopeChange, onPinned }) {
   const [conversations, setConversations] = useState([])
+  const [boards, setBoards] = useState([])
   const [activeId, setActiveId] = useState(null)
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
@@ -166,20 +167,54 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
     return []
   }, [])
 
+  const loadBoards = useCallback(async () => {
+    try {
+      const r = await fetch('/api/boards')
+      if (r.ok) setBoards((await r.json()).boards || [])
+    } catch {}
+  }, [])
+
+  useEffect(() => { if (open) loadBoards() }, [open, loadBoards])
+
+  // The investigation this conversation is scoped to (drives where its pins and
+  // the agent's pin/edit tools land). null = unscoped.
+  const scopeBoardId = conversations.find(c => c.id === activeId)?.board_id ?? null
+
+  // Report scope up so the board panel can default to the active chat's
+  // investigation when it opens.
+  useEffect(() => { onScopeChange?.(scopeBoardId) }, [scopeBoardId, onScopeChange])
+
+  const setConversationScope = useCallback(async (boardId) => {
+    if (!activeId) return
+    try {
+      await fetch(`/api/conversations/${activeId}/board`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ board_id: boardId }),
+      })
+      await loadConversations()
+    } catch {}
+  }, [activeId, loadConversations])
+
   // Pin a code/table block from an answer onto the investigation board, tagged
-  // with the conversation it came from, then open the board (via App).
+  // with the conversation it came from, then open the board (via App). Lands in
+  // the conversation's scoped investigation, else whichever board the board panel
+  // is showing.
   const pinBlock = useCallback(async ({ kind, content }) => {
     const id = activeIdRef.current
-    const title = conversations.find(c => c.id === id)?.title || ''
+    const conv = conversations.find(c => c.id === id)
+    const title = conv?.title || ''
+    const boardId = conv?.board_id ?? fallbackBoardId ?? null
     try {
-      await fetch('/api/board', {
+      const r = await fetch('/api/board', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ kind, content, source_conv: id, source_title: title }),
+        body: JSON.stringify({ kind, content, source_conv: id, source_title: title, board_id: boardId }),
       })
-      onPinned?.()
+      const d = await r.json().catch(() => ({}))
+      onPinned?.(d.card?.board_id ?? boardId)
     } catch {}
-  }, [conversations, onPinned])
+  }, [conversations, fallbackBoardId, onPinned])
 
   // Fetch a conversation's rendered turns without touching state. Returns the
   // array, null on 404 (gone), or undefined on a transient error.
@@ -398,12 +433,16 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
       pendingConvRef.current = null
       if (resumedRef.current.delete(ev.conv_id)) loadMessages(ev.conv_id)
       loadConversations()
+      // The agent may have scoped this conversation or created a new investigation
+      // mid-turn; refresh both so the scope dropdown shows the new value AND has an
+      // option for a freshly-created board.
+      loadBoards()
       // The titling sidecar names a conversation asynchronously after the turn
       // finishes (non-blocking), so the new title isn't ready at `done`. Refresh
       // once more shortly after to pick it up.
       setTimeout(loadConversations, 4000)
     }
-  }, [fetchRendered, loadMessages, loadConversations])
+  }, [fetchRendered, loadMessages, loadConversations, loadBoards])
 
   // Hold a WebSocket open while the panel is open, reconnecting on drop. On every
   // (re)connect, subscribe to the active conversation so an in-flight turn that
@@ -580,6 +619,22 @@ export default function AgentPanel({ open, setOpen, runProtected, pendingContext
         >＋</button>
         <button className="agent-collapse" onClick={() => setOpen(false)} title="Collapse" aria-label="Collapse">›</button>
       </div>
+
+      {activeId && (
+        <div className="agent-scope" title="Investigation this conversation is scoped to — its pins and the agent's pin/edit actions land here">
+          <span className="agent-scope-label">Investigation</span>
+          <select
+            className="agent-scope-select"
+            value={scopeBoardId ?? ''}
+            onChange={(e) => setConversationScope(e.target.value === '' ? null : Number(e.target.value))}
+          >
+            <option value="">None</option>
+            {boards.map(b => (
+              <option key={b.id} value={b.id}>{b.title}</option>
+            ))}
+          </select>
+        </div>
+      )}
 
       {listOpen && (
         <>

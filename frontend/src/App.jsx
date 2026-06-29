@@ -80,6 +80,19 @@ export default function App() {
   const [agentOpen, setAgentOpen] = useState(false)
   const [boardOpen, setBoardOpen] = useState(false)
   const [boardRefresh, setBoardRefresh] = useState(0)
+  // The investigation the board panel is currently showing; pins fall back to it
+  // when a conversation isn't itself scoped to an investigation.
+  const [activeBoardId, setActiveBoardId] = useState(null)
+  // The investigation the active agent conversation is scoped to (reported up by
+  // AgentPanel) — the board panel defaults to it when opened.
+  const [convScopeBoardId, setConvScopeBoardId] = useState(null)
+
+  // Open the investigation board, defaulting to a specific investigation (the
+  // active chat's scope, or a freshly-pinned card's board) when one is given.
+  const openBoard = useCallback((preferId) => {
+    if (preferId != null) setActiveBoardId(preferId)
+    setBoardOpen(true)
+  }, [])
   const [askContext, setAskContext] = useState(null)
   const [openConv, setOpenConv] = useState(null)
   const [authUser, setAuthUser] = useState(currentUser())
@@ -368,13 +381,15 @@ export default function App() {
         clearPendingContext={() => setAskContext(null)}
         openConvId={openConv}
         clearOpenConv={() => setOpenConv(null)}
-        onPinned={() => { setBoardRefresh(n => n + 1); setBoardOpen(true) }}
+        fallbackBoardId={activeBoardId}
+        onScopeChange={setConvScopeBoardId}
+        onPinned={(boardId) => { setBoardRefresh(n => n + 1); openBoard(boardId ?? convScopeBoardId) }}
       />
 
       {!boardOpen && (
         <button
           className="board-rail"
-          onClick={() => setBoardOpen(true)}
+          onClick={() => openBoard(convScopeBoardId)}
           title="Open investigation board"
           aria-label="Open investigation board"
         >
@@ -386,6 +401,9 @@ export default function App() {
         open={boardOpen}
         onClose={() => setBoardOpen(false)}
         refreshKey={boardRefresh}
+        runProtected={runProtected}
+        activeBoardId={activeBoardId}
+        setActiveBoardId={setActiveBoardId}
         onOpenConversation={(id) => { setOpenConv(id); setAgentOpen(true) }}
       />
 

@@ -20,6 +20,7 @@ from .safe_commands import is_safe_command
 from .prompt import (
     LOCAL_API,
     build_conversation_notes_block,
+    build_investigation_block,
     build_memory_block,
     build_runtime_context,
     build_system_prompt,
@@ -270,6 +271,123 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_investigations",
+            "description": (
+                "List the investigation boards (id, title, card count). Use this to "
+                "find an existing investigation to scope this conversation to before "
+                "pinning findings into it."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scope_investigation",
+            "description": (
+                "Scope THIS conversation to an existing investigation by id (see "
+                "list_investigations). Afterwards, pin_finding and update_investigation "
+                "act on that investigation. Use this when continuing work on an "
+                "existing investigation; use create_investigation to start a new one."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "board_id": {"type": "integer", "description": "The investigation id to scope this conversation to."}
+                },
+                "required": ["board_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_investigation",
+            "description": (
+                "Create a new investigation board and scope THIS conversation to it "
+                "automatically, so subsequent pin_finding/update_investigation calls "
+                "target it. Use at the start of a deeper investigation when no suitable "
+                "board exists yet. Returns the new investigation's id."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Short title for the investigation."},
+                    "description": {"type": "string", "description": "Optional one-line description of what's being investigated."},
+                },
+                "required": ["title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pin_finding",
+            "description": (
+                "Pin a finding onto this conversation's scoped investigation (scope it "
+                "first with scope_investigation or create_investigation). Pin a fenced "
+                "code block, a markdown table, or a ```mermaid diagram — the board "
+                "renders code/mermaid/tables. Do this after each meaningful discovery "
+                "so the investigation accumulates evidence. NOTE: every pinned card is "
+                "rendered back into your system prompt on subsequent steps (like your "
+                "memories/notes), so pinning also keeps the evidence in your own context "
+                "for the rest of this and future turns. Lands in the 'To investigate' "
+                "column by default."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "The raw markdown block to pin: a fenced ```code/```mermaid block, or a GFM table."},
+                    "kind": {"type": "string", "enum": ["code", "table"], "description": "'code' for code/mermaid fences, 'table' for a markdown table. Defaults to 'code'."},
+                    "col": {"type": "string", "enum": ["todo", "looking", "done"], "description": "Column to drop the card into. Defaults to 'todo'."},
+                },
+                "required": ["content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_investigation",
+            "description": (
+                "Edit the title and/or description of THIS conversation's scoped "
+                "investigation (scope it first). You cannot edit other investigations, "
+                "and deleting an investigation is a human-only action in the UI."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "New title (omit to leave unchanged)."},
+                    "description": {"type": "string", "description": "New description (omit to leave unchanged)."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "move_card",
+            "description": (
+                "Move a pinned card to another column on THIS conversation's scoped "
+                "investigation, to drive the kanban flow: 'todo' (To investigate) → "
+                "'looking' (actively working it) → 'done' (Resolved). Use the card's "
+                "integer id (shown as [id] in the Investigation board block of your "
+                "prompt). You can only move cards on the scoped investigation. By "
+                "default the card goes to the bottom of the target column."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "card_id": {"type": "integer", "description": "The id of the card to move (the [id] in the Investigation board block)."},
+                    "col": {"type": "string", "enum": ["todo", "looking", "done"], "description": "Destination column."},
+                },
+                "required": ["card_id", "col"],
+            },
+        },
+    },
 ]
 
 TAVILY_URL = "https://api.tavily.com/search"
@@ -409,6 +527,114 @@ def add_conversation_note(conv_id: str | None, note: str) -> str:
     return f"saved conversation note [{nid}]"
 
 
+# ── Investigation tools (scope-enforced) ─────────────────────────────────────
+# pin/edit always act on the CURRENT conversation's scoped investigation, looked
+# up via conv_id — so the model can never touch an investigation it isn't scoped
+# to. scope_investigation / create_investigation are the only ways to set scope.
+
+def list_investigations() -> str:
+    try:
+        boards = db.boards_list()
+    except Exception as e:
+        return f"(failed to list investigations: {e})"
+    if not boards:
+        return "(no investigations yet — create_investigation to start one)"
+    lines = [
+        f"[{b['id']}] {b['title']} — {b['card_count']} card(s)"
+        + (f" — {b['description']}" if b.get("description") else "")
+        for b in boards
+    ]
+    return "\n".join(lines)
+
+
+def scope_investigation(conv_id: str | None, board_id) -> str:
+    if not conv_id:
+        return "(scoping unavailable on this path; not set)"
+    try:
+        bid = int(board_id)
+    except (TypeError, ValueError):
+        return f"(invalid investigation id: {board_id!r})"
+    if not db.board_exists(bid):
+        return f"(no investigation with id {bid}; list_investigations to see them)"
+    db.chat_set_board(conv_id, bid)
+    return f"this conversation is now scoped to investigation [{bid}]"
+
+
+def create_investigation(conv_id: str | None, title: str, description: str | None = None) -> str:
+    title = (title or "").strip()
+    if not title:
+        return "(nothing created: empty title)"
+    try:
+        board = db.board_create(title, (description or "").strip() or None)
+    except Exception as e:
+        return f"(failed to create investigation: {e})"
+    if conv_id:
+        db.chat_set_board(conv_id, board["id"])
+        return f"created investigation [{board['id']}] '{board['title']}' and scoped this conversation to it"
+    return f"created investigation [{board['id']}] '{board['title']}'"
+
+
+def pin_finding(conv_id: str | None, content: str, kind: str = "code", col: str = "todo") -> str:
+    content = (content or "").strip()
+    if not content:
+        return "(nothing to pin: empty content)"
+    if kind not in ("code", "table"):
+        kind = "code"
+    if col not in ("todo", "looking", "done"):
+        col = "todo"
+    board_id = db.chat_get_board(conv_id) if conv_id else None
+    if board_id is None:
+        return ("(this conversation isn't scoped to an investigation — call "
+                "scope_investigation or create_investigation first, then pin)")
+    try:
+        card = db.board_add(kind, content, conv_id, None, col=col, board_id=board_id)
+    except Exception as e:
+        return f"(failed to pin: {e})"
+    return f"pinned card [{card['id']}] to investigation [{board_id}] ({col})"
+
+
+def update_investigation(conv_id: str | None, title: str | None = None,
+                         description: str | None = None) -> str:
+    board_id = db.chat_get_board(conv_id) if conv_id else None
+    if board_id is None:
+        return ("(this conversation isn't scoped to an investigation — scope it "
+                "first; you can only edit the scoped one)")
+    title = title.strip() if isinstance(title, str) else None
+    description = description.strip() if isinstance(description, str) else None
+    if not title and description is None:
+        return "(nothing to update: provide a title and/or description)"
+    board = db.board_update(board_id, title=title or None, description=description)
+    if board is None:
+        return f"(investigation [{board_id}] no longer exists)"
+    return f"updated investigation [{board_id}]"
+
+
+_BOARD_COL_LABELS = {"todo": "To investigate", "looking": "Looking", "done": "Resolved"}
+
+
+def move_card(conv_id: str | None, card_id, col: str) -> str:
+    board_id = db.chat_get_board(conv_id) if conv_id else None
+    if board_id is None:
+        return ("(this conversation isn't scoped to an investigation — scope it "
+                "first; you can only move cards on the scoped one)")
+    try:
+        cid = int(card_id)
+    except (TypeError, ValueError):
+        return f"(invalid card id: {card_id!r})"
+    if col not in _BOARD_COL_LABELS:
+        return f"(invalid column: {col!r}; use todo, looking, or done)"
+    cards = db.board_list(board_id)
+    if not any(c["id"] == cid for c in cards):
+        return (f"(card [{cid}] isn't on this conversation's scoped investigation "
+                f"[{board_id}]; you can only move cards pinned there)")
+    # Append to the bottom of the destination column (skip the card being moved).
+    others = [c["pos"] for c in cards if c["col"] == col and c["id"] != cid]
+    pos = (max(others) + 1) if others else 1.0
+    if not db.board_move(cid, col, pos):
+        return f"(card [{cid}] no longer exists)"
+    return f"moved card [{cid}] to {_BOARD_COL_LABELS[col]}"
+
+
 def get_stat(path: str) -> str:
     """Curl a GET endpoint on the local admindash API and return the body."""
     if not path.startswith("/"):
@@ -485,7 +711,8 @@ def web_search(query: str) -> str:
 def _with_memories(messages: list[dict], conv_id: str | None = None) -> list[dict]:
     """Return a copy of `messages` with the live runtime context (host facts +
     OpenAPI endpoint list) and current memories — and, when `conv_id` is given,
-    this conversation's notes after them — appended to the system prompt's content.
+    this conversation's notes plus its scoped investigation board after them —
+    appended to the system prompt's content.
     All are injected per-call and never persisted, so resumed chats and chats
     created before a deploy/save still see the current endpoint set and the latest
     memories, and notes added earlier in a conversation stay visible on later turns
@@ -495,6 +722,7 @@ def _with_memories(messages: list[dict], conv_id: str | None = None) -> list[dic
     block = build_runtime_context() + "\n\n" + build_memory_block()
     if conv_id:
         block += "\n\n" + build_conversation_notes_block(conv_id)
+        block += "\n\n" + build_investigation_block(conv_id)
     out = list(messages)
     if out and out[0].get("role") == "system":
         out[0] = {**out[0], "content": out[0]["content"] + "\n\n" + block}
@@ -738,6 +966,19 @@ def _run_loop(messages: list[dict], on_event=None, request_approval=None, conv_i
                 output = delete_memory(args.get("id"))
             elif name == "add_conversation_note":
                 output = add_conversation_note(conv_id, args.get("note", ""))
+            elif name == "list_investigations":
+                output = list_investigations()
+            elif name == "scope_investigation":
+                output = scope_investigation(conv_id, args.get("board_id"))
+            elif name == "create_investigation":
+                output = create_investigation(conv_id, args.get("title", ""), args.get("description"))
+            elif name == "pin_finding":
+                output = pin_finding(conv_id, args.get("content", ""),
+                                     args.get("kind", "code"), args.get("col", "todo"))
+            elif name == "update_investigation":
+                output = update_investigation(conv_id, args.get("title"), args.get("description"))
+            elif name == "move_card":
+                output = move_card(conv_id, args.get("card_id"), args.get("col", ""))
             else:
                 output = f"(unknown tool: {name})"
             messages.append(

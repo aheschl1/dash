@@ -1324,6 +1324,58 @@ body.agent-resizing .agent-resize::after { background: var(--accent); }
 }
 .board-close:hover { color: var(--text); }
 
+/* Investigation switcher (tabs of boards + create/rename/delete controls) */
+.board-tabs {
+  display: flex; align-items: center; gap: 6px;
+  flex: 1; min-width: 0; overflow-x: auto; padding-bottom: 2px;
+}
+.board-tab {
+  display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+  padding: 5px 11px; border-radius: 999px; cursor: pointer;
+  background: var(--surface2); border: 1px solid var(--border);
+  color: var(--text-muted); font-size: 12px; font-weight: 600;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.board-tab:hover { color: var(--text); }
+.board-tab.active {
+  color: var(--text); border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, var(--surface2));
+}
+.board-tab-count {
+  font-size: 10px; padding: 1px 6px; border-radius: 999px;
+  background: var(--bg); border: 1px solid var(--border); color: var(--text-muted);
+}
+.board-tab-new { font-size: 15px; line-height: 1; padding: 4px 10px; }
+.board-tab-input {
+  padding: 5px 10px; border-radius: 999px; font-size: 12px;
+  background: var(--bg); border: 1px solid var(--accent); color: var(--text);
+  outline: none; min-width: 160px;
+}
+.board-head-btn {
+  background: none; border: 1px solid var(--border); color: var(--text-muted);
+  font-size: 11px; font-weight: 600; padding: 4px 10px; border-radius: 6px;
+  cursor: pointer; transition: color 0.15s, border-color 0.15s;
+}
+.board-head-btn:hover { color: var(--text); border-color: var(--text-muted); }
+.board-head-del:hover { color: var(--red); border-color: var(--red); }
+
+/* Per-conversation investigation scope bar in the agent panel */
+.agent-scope {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 14px; border-bottom: 1px solid var(--border);
+  background: var(--surface2);
+}
+.agent-scope-label {
+  font-size: 11px; font-weight: 600; color: var(--text-muted);
+  text-transform: uppercase; letter-spacing: 0.3px;
+}
+.agent-scope-select {
+  flex: 1; min-width: 0; padding: 4px 8px; border-radius: 6px;
+  background: var(--bg); border: 1px solid var(--border); color: var(--text);
+  font-size: 12px; cursor: pointer; outline: none;
+}
+.agent-scope-select:focus { border-color: var(--accent); }
+
 /* Vertical stack of status lanes; each lane flows its cards as a variable-width
    masonry wall (flex-wrap, content-sized). The whole wall scrolls vertically. */
 .board-wall {

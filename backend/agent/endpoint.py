@@ -120,7 +120,22 @@ def get_conversation(conv_id: str):
     messages = store.get_copy(conv_id)
     if messages is None:
         return JSONResponse(status_code=404, content={"error": "unknown conversation"})
-    return {"id": conv_id, "messages": _render(messages)}
+    return {"id": conv_id, "messages": _render(messages),
+            "board_id": db.chat_get_board(conv_id)}
+
+
+@router.put("/api/conversations/{conv_id}/board")
+def scope_conversation(conv_id: str, board_id: int | None = Body(None, embed=True)):
+    """Scope a conversation to an investigation (board_id=null to unscope).
+
+    Public, like sends — scoping is part of the investigation workflow. The agent's
+    pin/edit tools confine themselves to whatever this is set to."""
+    if store.get_copy(conv_id) is None:
+        return JSONResponse(status_code=404, content={"error": "unknown conversation"})
+    if board_id is not None and not db.board_exists(board_id):
+        return JSONResponse(status_code=404, content={"error": "unknown investigation"})
+    db.chat_set_board(conv_id, board_id)
+    return {"id": conv_id, "board_id": board_id}
 
 
 @router.delete("/api/end/{conv_id}")

@@ -77,6 +77,13 @@ CREATE TABLE IF NOT EXISTS agent_memories (
     content    TEXT NOT NULL,
     created_at BIGINT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS boards (
+    id          SERIAL PRIMARY KEY,
+    title       TEXT NOT NULL,
+    description TEXT,
+    created_at  BIGINT NOT NULL,
+    updated_at  BIGINT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS board_cards (
     id           SERIAL PRIMARY KEY,
     kind         TEXT NOT NULL,
@@ -88,6 +95,16 @@ CREATE TABLE IF NOT EXISTS board_cards (
     created_at   BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_board_cards_col ON board_cards(col, pos);
+-- Investigations are now first-class containers; cards belong to one. Seed a
+-- default investigation for any pre-existing cards and adopt them into it.
+ALTER TABLE board_cards ADD COLUMN IF NOT EXISTS board_id INTEGER;
+INSERT INTO boards (title, description, created_at, updated_at)
+  SELECT 'Investigation', NULL,
+         EXTRACT(EPOCH FROM now())::BIGINT, EXTRACT(EPOCH FROM now())::BIGINT
+  WHERE NOT EXISTS (SELECT 1 FROM boards);
+UPDATE board_cards SET board_id = (SELECT MIN(id) FROM boards) WHERE board_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_board_cards_board ON board_cards(board_id, col, pos);
+ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS board_id INTEGER;
 CREATE TABLE IF NOT EXISTS conversation_notes (
     id         SERIAL PRIMARY KEY,
     conv_id    TEXT NOT NULL,
@@ -344,11 +361,37 @@ def chat_get(id: str) -> list[dict] | None:
 def chat_list(limit: int = 100) -> list[dict]:
     with psycopg.connect(DSN) as con:
         rows = con.execute(
-            "SELECT id, COALESCE(NULLIF(auto_title,''), title) AS title, turns "
+            "SELECT id, COALESCE(NULLIF(auto_title,''), title) AS title, turns, board_id "
             "FROM chat_sessions ORDER BY updated_at DESC LIMIT %s",
             (limit,),
         ).fetchall()
-    return [{"id": r[0], "title": r[1], "turns": r[2]} for r in rows]
+    return [{"id": r[0], "title": r[1], "turns": r[2], "board_id": r[3]} for r in rows]
+
+
+def chat_set_board(id: str, board_id: int | None) -> None:
+    """Scope a conversation to an investigation (None to unscope).
+
+    Upserts so scoping works even before the conversation's row is lazily created
+    on its first saved turn (a new chat, or the agent auto-scoping mid first turn).
+    chat_save's ON CONFLICT update never touches board_id, so the scope survives
+    every subsequent turn."""
+    now = int(datetime.now(timezone.utc).timestamp())
+    with psycopg.connect(DSN) as con:
+        con.execute(
+            "INSERT INTO chat_sessions (id, title, turns, messages, created_at, updated_at, board_id) "
+            "VALUES (%s,'',0,'[]'::jsonb,%s,%s,%s) "
+            "ON CONFLICT (id) DO UPDATE SET board_id=EXCLUDED.board_id",
+            (id, now, now, board_id),
+        )
+        con.commit()
+
+
+def chat_get_board(id: str) -> int | None:
+    with psycopg.connect(DSN) as con:
+        row = con.execute(
+            "SELECT board_id FROM chat_sessions WHERE id=%s", (id,)
+        ).fetchone()
+    return row[0] if row else None
 
 
 def chat_has_auto_title(id: str) -> bool:
@@ -447,42 +490,132 @@ def memory_list() -> list[dict]:
     return [{"id": r[0], "content": r[1], "created_at": r[2]} for r in rows]
 
 
-# ── Investigation board ───────────────────────────────────────────────────────
+# ── Investigations (boards) ───────────────────────────────────────────────────
+# An investigation is a container; cards (pinned code/table/mermaid blocks) belong
+# to exactly one. A conversation may be scoped to one investigation (chat_sessions
+# .board_id) so the agent's pins/edits are confined to it.
 
-_BOARD_COLS = "id, kind, content, col, pos, source_conv, source_title, created_at"
+
+def _default_board_id(con) -> int | None:
+    row = con.execute("SELECT MIN(id) FROM boards").fetchone()
+    return row[0] if row else None
+
+
+def boards_list() -> list[dict]:
+    with psycopg.connect(DSN) as con:
+        rows = con.execute(
+            "SELECT b.id, b.title, b.description, b.created_at, b.updated_at, "
+            "       COUNT(c.id) AS card_count "
+            "FROM boards b LEFT JOIN board_cards c ON c.board_id = b.id "
+            "GROUP BY b.id ORDER BY b.id"
+        ).fetchall()
+    return [
+        {"id": r[0], "title": r[1], "description": r[2],
+         "created_at": r[3], "updated_at": r[4], "card_count": r[5]}
+        for r in rows
+    ]
+
+
+def _board_meta_row(r) -> dict:
+    return {"id": r[0], "title": r[1], "description": r[2],
+            "created_at": r[3], "updated_at": r[4]}
+
+
+def board_create(title: str, description: str | None = None) -> dict:
+    now = int(datetime.now(timezone.utc).timestamp())
+    with psycopg.connect(DSN) as con:
+        row = con.execute(
+            "INSERT INTO boards (title, description, created_at, updated_at) "
+            "VALUES (%s,%s,%s,%s) RETURNING id, title, description, created_at, updated_at",
+            (title, description, now, now),
+        ).fetchone()
+        con.commit()
+    return _board_meta_row(row)
+
+
+def board_update(id: int, title: str | None = None,
+                 description: str | None = None) -> dict | None:
+    """Partial edit of an investigation's title/description. None if no such id."""
+    now = int(datetime.now(timezone.utc).timestamp())
+    sets, params = ["updated_at=%s"], [now]
+    if title is not None:
+        sets.append("title=%s"); params.append(title)
+    if description is not None:
+        sets.append("description=%s"); params.append(description)
+    params.append(id)
+    with psycopg.connect(DSN) as con:
+        row = con.execute(
+            f"UPDATE boards SET {', '.join(sets)} WHERE id=%s "
+            f"RETURNING id, title, description, created_at, updated_at",
+            params,
+        ).fetchone()
+        con.commit()
+    return _board_meta_row(row) if row else None
+
+
+def board_delete_investigation(id: int) -> bool:
+    """Delete an investigation and all of its cards. False if no such id."""
+    with psycopg.connect(DSN) as con:
+        con.execute("DELETE FROM board_cards WHERE board_id=%s", (id,))
+        n = con.execute("DELETE FROM boards WHERE id=%s", (id,)).rowcount
+        con.commit()
+    return n > 0
+
+
+def board_exists(id: int) -> bool:
+    with psycopg.connect(DSN) as con:
+        return con.execute("SELECT 1 FROM boards WHERE id=%s", (id,)).fetchone() is not None
+
+
+# ── Investigation cards ───────────────────────────────────────────────────────
+
+_BOARD_COLS = "id, kind, content, col, pos, source_conv, source_title, created_at, board_id"
 
 
 def _board_row(r) -> dict:
     return {
         "id": r[0], "kind": r[1], "content": r[2], "col": r[3], "pos": r[4],
         "source_conv": r[5], "source_title": r[6], "created_at": r[7],
+        "board_id": r[8],
     }
 
 
 def board_add(
     kind: str, content: str, source_conv: str | None, source_title: str | None,
-    col: str = "todo",
+    col: str = "todo", board_id: int | None = None,
 ) -> dict:
-    """Pin a code/table block onto the board, appended to the bottom of `col`."""
+    """Pin a code/table block into an investigation, at the bottom of `col`.
+
+    Defaults to the lowest-id (legacy/default) investigation when board_id is
+    omitted, for back-compat with callers that predate multiple investigations.
+    """
     now = int(datetime.now(timezone.utc).timestamp())
     with psycopg.connect(DSN) as con:
+        if board_id is None:
+            board_id = _default_board_id(con)
         nxt = con.execute(
-            "SELECT COALESCE(MAX(pos), 0) + 1 FROM board_cards WHERE col=%s", (col,)
+            "SELECT COALESCE(MAX(pos), 0) + 1 FROM board_cards WHERE board_id=%s AND col=%s",
+            (board_id, col),
         ).fetchone()[0]
         row = con.execute(
-            f"INSERT INTO board_cards (kind, content, col, pos, source_conv, source_title, created_at) "
-            f"VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING {_BOARD_COLS}",
-            (kind, content, col, nxt, source_conv, source_title, now),
+            f"INSERT INTO board_cards (kind, content, col, pos, source_conv, source_title, created_at, board_id) "
+            f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING {_BOARD_COLS}",
+            (kind, content, col, nxt, source_conv, source_title, now, board_id),
         ).fetchone()
         con.commit()
     return _board_row(row)
 
 
-def board_move(id: int, col: str, pos: float) -> bool:
-    """Reassign a card's column and fractional position. False if no such id."""
+def board_move(id: int, col: str, pos: float, board_id: int | None = None) -> bool:
+    """Reassign a card's column/position, optionally moving it to another
+    investigation. False if no such id."""
+    sets, params = ["col=%s", "pos=%s"], [col, pos]
+    if board_id is not None:
+        sets.append("board_id=%s"); params.append(board_id)
+    params.append(id)
     with psycopg.connect(DSN) as con:
         n = con.execute(
-            "UPDATE board_cards SET col=%s, pos=%s WHERE id=%s", (col, pos, id)
+            f"UPDATE board_cards SET {', '.join(sets)} WHERE id=%s", params
         ).rowcount
         con.commit()
     return n > 0
@@ -495,10 +628,14 @@ def board_delete(id: int) -> bool:
     return n > 0
 
 
-def board_list() -> list[dict]:
+def board_list(board_id: int | None = None) -> list[dict]:
+    """Cards for one investigation (default: the lowest-id board when omitted)."""
     with psycopg.connect(DSN) as con:
+        if board_id is None:
+            board_id = _default_board_id(con)
         rows = con.execute(
-            f"SELECT {_BOARD_COLS} FROM board_cards ORDER BY col, pos"
+            f"SELECT {_BOARD_COLS} FROM board_cards WHERE board_id=%s ORDER BY col, pos",
+            (board_id,),
         ).fetchall()
     return [_board_row(r) for r in rows]
 

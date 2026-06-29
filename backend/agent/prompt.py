@@ -105,6 +105,48 @@ Andrew's approval. When he asks for an action the API exposes, prefer `post` ove
 matters only within THIS chat (it never crosses to other conversations). Use \
 save_memory for machine-wide durable facts, this for chat-local context. Your \
 notes appear below your memories.
+- `list_investigations` / `scope_investigation` / `create_investigation` / \
+`pin_finding` / `move_card` / `update_investigation` — manage investigation boards \
+(see below). You can create, view, scope, pin to, move cards on, and rename \
+investigations; DELETING an investigation is a human-only action in the UI.
+
+Investigations (boards):
+An investigation is a board of pinned evidence (code blocks, tables, mermaid \
+diagrams) for one incident or question. A conversation can be SCOPED to one \
+investigation, and your pin_finding/update_investigation calls always act on the \
+conversation's scoped investigation — never any other.
+
+IMPORTANT — pinning is also how you give yourself working memory: the scoped \
+investigation's title and every card pinned on it are rendered into your system \
+prompt on EVERY following step (just like your memories and conversation notes \
+are), under "Investigation board". So when you pin_finding, that evidence enters \
+your own context window and stays visible for the rest of this turn and all future \
+turns of this conversation — and the board is shared with the user, who sees the \
+same cards live. Pin the things you'll want to still have in front of you later: a \
+key command's output, a config snippet, a diagram of what you found. (An unscoped \
+conversation has no board in your prompt, and pin_finding will refuse until you \
+scope or create one.)
+
+For a deeper investigation, follow this order of operations:
+1. SCOPE — `scope_investigation` onto an existing relevant board (find it with \
+`list_investigations`), or `create_investigation` to start a fresh one (creating \
+auto-scopes this conversation to it). Do this first.
+2. INVESTIGATE — use your read-only tools (get_stat, cat_file, ls_folder, \
+root_bash, web_search) to dig into the question.
+3. PIN AS YOU GO — after each meaningful discovery, `pin_finding` to drop the \
+evidence (a code block, table, or ```mermaid diagram) onto the scoped board. It \
+accumulates a record of what you found AND keeps that evidence in your context for \
+later steps, so you don't have to re-run a tool to re-read it. Use \
+`update_investigation` to refine the board's title/description as the picture \
+sharpens.
+4. WORK THE KANBAN — the board has three columns: 'todo' (To investigate) → \
+'looking' (actively working it) → 'done' (Resolved). Use `move_card` (by the [id] \
+shown next to each card in your Investigation board block) to advance cards as you \
+make progress: pull a lead into 'looking' when you start on it, push it to 'done' \
+once it's resolved. Keep the board's state honest so it reflects where the \
+investigation actually stands.
+For a quick one-off question, you don't need an investigation; reserve them for \
+work worth tracking.
 """
 
 
@@ -234,6 +276,60 @@ def build_conversation_notes_block(conv_id: str) -> str:
         "Notes for this conversation — context you saved earlier in THIS chat "
         "(scoped here only, not shared with other conversations):\n" + lines
     )
+
+
+_BOARD_COL_LABELS = {"todo": "To investigate", "looking": "Looking", "done": "Resolved"}
+_CARD_MAX = 2000
+
+
+def build_investigation_block(conv_id: str) -> str:
+    """Render the investigation THIS conversation is scoped to — its title and the
+    cards pinned on it — so the model can read its own evidence board, the same way
+    it reads memories and notes. Injected fresh per run (see
+    agent.main._with_memories), never persisted. Pinning a finding (pin_finding)
+    is what populates this; scope_investigation/create_investigation set which
+    board it reflects. Unscoped conversations get a short nudge instead."""
+    try:
+        board_id = db.chat_get_board(conv_id)
+    except Exception as e:
+        return f"Investigation board:\n(failed to load: {e})"
+    if board_id is None:
+        return (
+            "Investigation board: this conversation is NOT scoped to an "
+            "investigation. For work worth tracking, scope_investigation onto an "
+            "existing one or create_investigation to start a new one, then "
+            "pin_finding as you discover things."
+        )
+    try:
+        meta = next((b for b in db.boards_list() if b["id"] == board_id), None)
+        cards = db.board_list(board_id)
+    except Exception as e:
+        return f"Investigation board:\n(failed to load: {e})"
+    if meta is None:
+        return (
+            "Investigation board: the investigation this conversation was scoped to "
+            "no longer exists. Re-scope or create a new one before pinning."
+        )
+    head = f"Investigation board — '{meta['title']}' [{board_id}]"
+    if meta.get("description"):
+        head += f": {meta['description']}"
+    if not cards:
+        return (
+            head + "\nThis conversation is scoped to this investigation, but nothing "
+            "is pinned yet. Use pin_finding to add evidence (code, tables, mermaid "
+            "diagrams) as you discover it."
+        )
+    parts = [
+        head + ". These are the findings pinned here so far (you and the user "
+        "share this board — pin new evidence with pin_finding):"
+    ]
+    for c in cards:
+        body = c["content"]
+        if len(body) > _CARD_MAX:
+            body = body[:_CARD_MAX] + "\n… (truncated)"
+        label = _BOARD_COL_LABELS.get(c["col"], c["col"])
+        parts.append(f"[{c['id']}] ({label})\n{body}")
+    return "\n\n".join(parts)
 
 
 def build_system_prompt() -> str:
